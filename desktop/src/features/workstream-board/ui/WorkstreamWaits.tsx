@@ -11,9 +11,9 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { useOpenEntityLink } from "@/shared/ui/markdown/entityLinks";
 import { cn } from "@/shared/lib/cn";
 
-function waitAge(since: string | undefined, now: number): string {
+export function waitAge(since: string | undefined, now: number): string {
   const then = since ? Date.parse(since) : Number.NaN;
-  if (!Number.isFinite(then)) return "Now";
+  if (!Number.isFinite(then)) return "Unknown";
   const minutes = Math.max(0, Math.floor((now - then) / 60_000));
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
@@ -75,7 +75,7 @@ export function WorkstreamWaits({
   return (
     <section
       aria-label="Blockers"
-      className="pointer-events-auto mt-1 border-t border-border/60 pt-2"
+      className="pointer-events-none mt-1 border-t border-border/60 pt-2"
       data-testid="workstream-waits"
     >
       <div className="mb-1.5 flex items-center justify-between gap-2 text-2xs text-muted-foreground">
@@ -84,8 +84,9 @@ export function WorkstreamWaits({
         </p>
         <span>oldest first</span>
       </div>
-      <ul className="space-y-1">
+      <ul className="pointer-events-auto space-y-1">
         {orderedWaits.map((wait) => {
+          const age = waitAge(wait.since, now);
           const reference = referencesByIdentity.get(wait.key);
           const open = reference
             ? () => {
@@ -111,7 +112,7 @@ export function WorkstreamWaits({
                 </span>
               </span>
               <span className="shrink-0 text-right text-3xs text-amber-800 dark:text-amber-200/80">
-                {waitAge(wait.since, now)}
+                <span className="block">{age}</span>
                 <span className="block uppercase tracking-wide text-muted-foreground">
                   {wait.actor.kind} · {wait.source}
                 </span>
