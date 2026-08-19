@@ -1,8 +1,8 @@
 //! Streaming synthesis path for the TTS worker.
 //!
 //! PCM deltas stream out of Pocket as they are generated instead of waiting
-//! for the full first-chunk synthesis. `BUZZ_TTS_STREAMING=0` restores the
-//! batch path as an operational fallback.
+//! for the full first-chunk synthesis. `BUZZ_TTS_STREAMING=0` or `false`
+//! restores the batch path as an operational fallback.
 //! `BUZZ_TTS_EMIT_FRAMES` tunes the delta size in Flow LM frames (80 ms of
 //! audio each). Default 12 = the Mimi decoder's native chunk, which keeps
 //! streamed audio bit-identical to the batch path; smaller deltas are faster
@@ -14,7 +14,8 @@ use super::*;
 use crate::huddle::pocket::{PocketTts, VoiceStyle};
 
 /// Read the streaming env overrides once per worker. Streaming defaults to the
-/// Mimi decoder's native 12-frame chunk; `BUZZ_TTS_STREAMING=0` opts out.
+/// Mimi decoder's native 12-frame chunk; `BUZZ_TTS_STREAMING=0` or `false`
+/// opts out.
 pub(super) fn streaming_emit_frames() -> Option<usize> {
     resolve_streaming_emit_frames(
         std::env::var("BUZZ_TTS_STREAMING").ok().as_deref(),
@@ -26,7 +27,8 @@ fn resolve_streaming_emit_frames(
     enabled: Option<&str>,
     emit_frames: Option<&str>,
 ) -> Option<usize> {
-    (enabled != Some("0")).then(|| emit_frames.and_then(|v| v.parse().ok()).unwrap_or(12))
+    (!matches!(enabled, Some("0" | "false")))
+        .then(|| emit_frames.and_then(|v| v.parse().ok()).unwrap_or(12))
 }
 
 /// Playback context threaded through one streamed chunk.
@@ -142,6 +144,7 @@ mod tests {
     #[test]
     fn streaming_can_be_disabled_for_operational_rollback() {
         assert_eq!(resolve_streaming_emit_frames(Some("0"), None), None);
+        assert_eq!(resolve_streaming_emit_frames(Some("false"), None), None);
     }
 
     #[test]
