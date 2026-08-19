@@ -426,8 +426,8 @@ fn tts_worker(
     // `tts_active` lifecycle: set on the first append while idle, cleared
     // whenever the player has fully drained — either in the idle timeout
     // arm or on item receipt before synthesis begins.
-    // EXPERIMENTAL (latency bench): `Some(emit_frames)` = stream PCM deltas
-    // out of Pocket as they are generated (see tts_streaming.rs).
+    // `Some(emit_frames)` streams PCM deltas out of Pocket as they are
+    // generated (see tts_streaming.rs). `None` is the operational fallback.
     let tts_streaming = streaming_emit_frames();
     // `first_append` = "no audio queued since the player last went idle".
     // Flipped by `build_sentence_append_buffer` on the first real append; the
@@ -728,8 +728,8 @@ fn tts_worker(
                 continue;
             }
 
-            // EXPERIMENTAL (latency bench): streaming synthesis path — see
-            // tts_streaming.rs for the mechanics and exactness constraints.
+            // Streaming synthesis path. See tts_streaming.rs for the mechanics
+            // and exactness constraints.
             if let Some(emit_frames) = tts_streaming {
                 let outcome = synthesize_streaming(
                     &engine,

@@ -1,7 +1,8 @@
-//! EXPERIMENTAL (latency bench): streaming synthesis path for the TTS worker.
+//! Streaming synthesis path for the TTS worker.
 //!
-//! `BUZZ_TTS_STREAMING=1` streams PCM deltas out of Pocket as they are
-//! generated instead of waiting for the full first-chunk synthesis.
+//! PCM deltas stream out of Pocket as they are generated instead of waiting
+//! for the full first-chunk synthesis. `BUZZ_TTS_STREAMING=0` restores the
+//! batch path as an operational fallback.
 //! `BUZZ_TTS_EMIT_FRAMES` tunes the delta size in Flow LM frames (80 ms of
 //! audio each). Default 12 = the Mimi decoder's native chunk, which keeps
 //! streamed audio bit-identical to the batch path; smaller deltas are faster
@@ -12,17 +13,20 @@ use super::*;
 
 use crate::huddle::pocket::{PocketTts, VoiceStyle};
 
-/// Read the streaming env overrides once per worker: `Some(emit_frames)`
-/// when `BUZZ_TTS_STREAMING=1`, `None` for the production batch path.
+/// Read the streaming env overrides once per worker. Streaming defaults to the
+/// Mimi decoder's native 12-frame chunk; `BUZZ_TTS_STREAMING=0` opts out.
 pub(super) fn streaming_emit_frames() -> Option<usize> {
-    std::env::var("BUZZ_TTS_STREAMING")
-        .is_ok_and(|v| v == "1")
-        .then(|| {
-            std::env::var("BUZZ_TTS_EMIT_FRAMES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(12)
-        })
+    resolve_streaming_emit_frames(
+        std::env::var("BUZZ_TTS_STREAMING").ok().as_deref(),
+        std::env::var("BUZZ_TTS_EMIT_FRAMES").ok().as_deref(),
+    )
+}
+
+fn resolve_streaming_emit_frames(
+    enabled: Option<&str>,
+    emit_frames: Option<&str>,
+) -> Option<usize> {
+    (enabled != Some("0")).then(|| emit_frames.and_then(|v| v.parse().ok()).unwrap_or(12))
 }
 
 /// Playback context threaded through one streamed chunk.
@@ -128,6 +132,26 @@ fn drive_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_defaults_to_the_bit_exact_decoder_chunk() {
+        assert_eq!(resolve_streaming_emit_frames(None, None), Some(12));
+        assert_eq!(resolve_streaming_emit_frames(Some("1"), None), Some(12));
+    }
+
+    #[test]
+    fn streaming_can_be_disabled_for_operational_rollback() {
+        assert_eq!(resolve_streaming_emit_frames(Some("0"), None), None);
+    }
+
+    #[test]
+    fn explicit_emit_frames_remain_available_for_latency_benches() {
+        assert_eq!(resolve_streaming_emit_frames(None, Some("6")), Some(6));
+        assert_eq!(
+            resolve_streaming_emit_frames(None, Some("invalid")),
+            Some(12)
+        );
+    }
 
     #[test]
     fn inference_failure_fades_the_retained_final_block() {
