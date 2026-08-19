@@ -30,6 +30,7 @@ pub(super) struct StreamingPlayback<'a> {
     pub(super) player: &'a rodio::Player,
     pub(super) first_append: &'a mut bool,
     pub(super) route_id: u64,
+    pub(super) clear_audio: &'a mut dyn FnMut(),
 }
 
 /// Synthesize one text chunk through `synth_chunk_streaming`, appending PCM
@@ -51,15 +52,31 @@ pub(super) fn synthesize_streaming(
     playback: StreamingPlayback<'_>,
     append_audio: &mut dyn FnMut(PreparedModelAudio) -> bool,
 ) -> Option<&'static str> {
+    drive_streaming(
+        |on_audio| engine.synth_chunk_streaming(text, style, emit_frames, on_audio),
+        signals,
+        playback,
+        append_audio,
+    )
+}
+
+fn drive_streaming(
+    synthesize: impl FnOnce(&mut dyn FnMut(Vec<f32>) -> bool) -> Result<bool, String>,
+    signals: (&AtomicBool, &AtomicBool, &AtomicBool),
+    playback: StreamingPlayback<'_>,
+    append_audio: &mut dyn FnMut(PreparedModelAudio) -> bool,
+) -> Option<&'static str> {
     let (cancel, voice_cancel, shutdown) = signals;
     let StreamingPlayback {
         player,
         first_append,
         route_id,
+        clear_audio,
     } = playback;
     let mut playback_audio = PlaybackChunkAudio::new();
     let mut delta_index = 0usize;
-    let stream_result = engine.synth_chunk_streaming(text, style, emit_frames, &mut |samples| {
+    let mut appended_audio = false;
+    let stream_result = synthesize(&mut |samples| {
         if cancel.load(Ordering::Acquire)
             || voice_cancel.load(Ordering::Acquire)
             || shutdown.load(Ordering::Acquire)
@@ -74,6 +91,7 @@ pub(super) fn synthesize_streaming(
             if !append_audio(prepared) {
                 return false;
             }
+            appended_audio = true;
         }
         true
     });
@@ -95,10 +113,159 @@ pub(super) fn synthesize_streaming(
             Some("cancelled")
         }
         Err(_) => {
+            if appended_audio {
+                // Earlier deltas from this chunk are already queued. Letting
+                // them drain would play a truncated phrase with no final fade,
+                // so fail closed at the same serialized player boundary used
+                // by Stop/cancellation.
+                clear_audio();
+                *first_append = true;
+            }
             eprintln!(
                 "buzz-desktop: tts stage=synthesis status=failed reason=inference route_id={route_id}"
             );
             Some("failed")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inference_failure_clears_already_queued_audio() {
+        let cancel = AtomicBool::new(false);
+        let voice_cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let mut first_append = true;
+        let (player, _output) = rodio::Player::new();
+        let mut appended = 0;
+        let mut cleared = 0;
+
+        let outcome = drive_streaming(
+            |on_audio| {
+                assert!(on_audio(vec![0.4; 16]));
+                assert!(on_audio(vec![0.5; 16]));
+                Err("inference failed after output".into())
+            },
+            (&cancel, &voice_cancel, &shutdown),
+            StreamingPlayback {
+                player: &player,
+                first_append: &mut first_append,
+                route_id: 7,
+                clear_audio: &mut || cleared += 1,
+            },
+            &mut |_| {
+                appended += 1;
+                true
+            },
+        );
+
+        assert_eq!(outcome, Some("failed"));
+        assert_eq!(appended, 1, "the first delta was already accepted");
+        assert_eq!(cleared, 1, "partial playback must fail closed");
+        assert!(first_append, "the next utterance needs a fresh lead-in");
+    }
+
+    #[test]
+    fn inference_failure_before_output_preserves_existing_playback() {
+        let cancel = AtomicBool::new(false);
+        let voice_cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let mut first_append = false;
+        let (player, _output) = rodio::Player::new();
+        let mut cleared = 0;
+
+        let outcome = drive_streaming(
+            |_| Err("inference failed before output".into()),
+            (&cancel, &voice_cancel, &shutdown),
+            StreamingPlayback {
+                player: &player,
+                first_append: &mut first_append,
+                route_id: 7,
+                clear_audio: &mut || cleared += 1,
+            },
+            &mut |_| panic!("no audio should be appended"),
+        );
+
+        assert_eq!(outcome, Some("failed"));
+        assert_eq!(cleared, 0, "unrelated queued playback must survive");
+        assert!(!first_append, "the existing utterance still owns playback");
+    }
+
+    #[test]
+    fn each_stop_signal_prevents_later_stream_output() {
+        for signal_index in 0..3 {
+            let signals = [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ];
+            let mut first_append = true;
+            let (player, _output) = rodio::Player::new();
+            let mut appended = 0;
+            let mut cleared = 0;
+
+            let outcome = drive_streaming(
+                |on_audio| {
+                    assert!(on_audio(vec![0.4; 16]));
+                    signals[signal_index].store(true, Ordering::Release);
+                    assert!(!on_audio(vec![0.5; 16]));
+                    Ok(false)
+                },
+                (&signals[0], &signals[1], &signals[2]),
+                StreamingPlayback {
+                    player: &player,
+                    first_append: &mut first_append,
+                    route_id: 7,
+                    clear_audio: &mut || cleared += 1,
+                },
+                &mut |_| {
+                    appended += 1;
+                    true
+                },
+            );
+
+            assert_eq!(outcome, Some("cancelled"));
+            assert_eq!(appended, 0, "no retained block may escape after Stop");
+            assert_eq!(cleared, 0, "the existing cancellation path owns clearing");
+            assert!(first_append);
+        }
+    }
+
+    #[test]
+    fn rejected_append_never_flushes_the_retained_final_block() {
+        let cancel = AtomicBool::new(false);
+        let voice_cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let mut first_append = true;
+        let (player, _output) = rodio::Player::new();
+        let mut append_attempts = 0;
+        let mut cleared = 0;
+
+        let outcome = drive_streaming(
+            |on_audio| {
+                assert!(on_audio(vec![0.4; 16]));
+                assert!(!on_audio(vec![0.5; 16]));
+                Ok(false)
+            },
+            (&cancel, &voice_cancel, &shutdown),
+            StreamingPlayback {
+                player: &player,
+                first_append: &mut first_append,
+                route_id: 7,
+                clear_audio: &mut || cleared += 1,
+            },
+            &mut |_| {
+                append_attempts += 1;
+                false
+            },
+        );
+
+        assert_eq!(outcome, Some("cancelled"));
+        assert_eq!(append_attempts, 1);
+        assert_eq!(cleared, 0);
+        assert!(first_append);
     }
 }

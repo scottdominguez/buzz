@@ -741,6 +741,16 @@ fn tts_worker(
                         player: &player,
                         first_append: &mut first_append,
                         route_id,
+                        clear_audio: &mut || {
+                            let _ops = lock_player_ops(&player_ops);
+                            player.clear();
+                            player.play();
+                            tts_active.store(false, Ordering::Release);
+                            active_speaker
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take();
+                        },
                     },
                     &mut |prepared| {
                         if !append_audio(
