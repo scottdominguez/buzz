@@ -3,6 +3,10 @@ import * as React from "react";
 
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
+import {
+  mergeOpenChannelDirectory,
+  useOpenChannelDirectoryQuery,
+} from "@/features/channels/hooks";
 import { useSearchResults } from "@/features/search/useSearchResults";
 import {
   resultIcon,
@@ -417,6 +421,16 @@ export function TopbarSearch({
   const dialogInputRef = React.useRef<HTMLInputElement>(null);
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
     useDeferredModalOpen();
+  // Global search surfaces non-member open channels, so while the dialog is
+  // open it fetches the discovery superset on demand rather than depending on
+  // the member-only poll list. Scoped search (channelId set) needs no directory.
+  const openDirectoryQuery = useOpenChannelDirectoryQuery({
+    enabled: isOpen && !scopeChannelId,
+  });
+  const searchChannels = React.useMemo(
+    () => mergeOpenChannelDirectory(channels, openDirectoryQuery.data),
+    [channels, openDirectoryQuery.data],
+  );
   const {
     channelLookup,
     debouncedQuery,
@@ -430,7 +444,7 @@ export function TopbarSearch({
     userSearchQuery,
   } = useSearchResults({
     channelLabels,
-    channels,
+    channels: searchChannels,
     enabled: isOpen,
     limit: SEARCH_RESULT_LIMIT,
     scopeChannelId,

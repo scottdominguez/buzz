@@ -147,16 +147,36 @@ fn compute_channels_hash(channels: &[ChannelInfo]) -> String {
 
 // ── Core fetch implementation ─────────────────────────────────────────────────
 
-/// Fetch the full channel list from the relay. Called by both `get_channels`
-/// (the Tauri command, which wraps the result with hash-based short-circuit
-/// logic) and `ensure_starter_channels` (which needs the raw list directly).
+/// Whether `fetch_channels` includes the unbounded all-open directory scan.
+///
+/// The 60s channel poll uses [`DirectoryScope::MemberOnly`]: it resolves only
+/// the channels the identity belongs to (plus its own not-yet-propagated
+/// creations), so phase 2's fan-out is bounded by membership instead of the
+/// entire relay. [`DirectoryScope::IncludeOpenDirectory`] additionally scans
+/// every open channel — the discovery surfaces (channel browser, global
+/// search) and onboarding need that superset, but the poll must not pay for it
+/// on every tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryScope {
+    MemberOnly,
+    IncludeOpenDirectory,
+}
+
+/// Fetch the channel list from the relay at the requested [`DirectoryScope`].
+/// Called by `get_channels` (member-only poll, wrapped with hash-based
+/// short-circuit logic), `get_open_channel_directory` (discovery superset), and
+/// `ensure_starter_channels` (which needs the raw open-inclusive list).
 ///
 /// Relay round-trips run in two concurrent phases:
-/// - Phase 1 (parallel): member-chain (kind:39002→kind:39000), open directory
-///   (kind:39000 all-open), and hidden-DM snapshot (kind:30622).
+/// - Phase 1 (parallel): member-chain (kind:39002→kind:39000), the non-member
+///   metadata source (pending-owned ids when member-only, else the all-open
+///   kind:39000 scan), and the hidden-DM snapshot (kind:30622).
 /// - Phase 2 (parallel): member counts (kind:39002 batch) and last-message
-///   timestamps (per-channel kind:9/40002).
-async fn fetch_channels(state: &AppState) -> Result<Vec<ChannelInfo>, String> {
+///   timestamps (per-channel kind:9/40002), fanned out over the merged set.
+async fn fetch_channels(
+    state: &AppState,
+    scope: DirectoryScope,
+) -> Result<Vec<ChannelInfo>, String> {
     #[cfg(debug_assertions)]
     let _profile_start = std::time::Instant::now();
 
@@ -165,8 +185,15 @@ async fn fetch_channels(state: &AppState) -> Result<Vec<ChannelInfo>, String> {
         keys.public_key().to_hex()
     };
 
-    // Phase 1 — concurrent: member-chain (steps 1→2), open directory (step 3),
-    // and hidden-DM snapshot (step 6). These three have no mutual dependencies.
+    // Channels this identity created whose kind:39002 membership hasn't yet
+    // propagated. Under member-only scope they are the only non-member
+    // metadata we resolve, so a just-created channel stays visible without the
+    // all-open scan (#1761). Read before the member chain runs; any that have
+    // since become real members are harmlessly skipped during the merge.
+    let pending_owned_ids = state.pending_owned_channel_ids(&my_pubkey);
+
+    // Phase 1 — concurrent: member-chain (steps 1→2), the non-member metadata
+    // source (step 3), and hidden-DM snapshot (step 6). No mutual dependencies.
     let (member_chain_result, open_meta_result, hidden_dms) = tokio::join!(
         // Steps 1+2: find the channels this identity belongs to, then fetch
         // their metadata events.
@@ -220,9 +247,30 @@ async fn fetch_channels(state: &AppState) -> Result<Vec<ChannelInfo>, String> {
 
             Ok::<_, String>(meta_events)
         },
-        // Step 3: fetch ALL open channel metadata so the channel browser can show
-        // discoverable channels the user hasn't joined yet.
-        query_relay_all(state, serde_json::json!({"kinds": [39000]})),
+        // Step 3: non-member channel metadata (kind:39000).
+        // - IncludeOpenDirectory: scan ALL open channels so the discovery
+        //   surfaces can show joinable channels the user hasn't joined yet.
+        // - MemberOnly: resolve only the pending-owned ids, keeping a
+        //   just-created channel visible without the unbounded all-open scan.
+        async {
+            match scope {
+                DirectoryScope::IncludeOpenDirectory => {
+                    query_relay_all(state, serde_json::json!({"kinds": [39000]})).await
+                }
+                DirectoryScope::MemberOnly if !pending_owned_ids.is_empty() => {
+                    query_relay(
+                        state,
+                        &[serde_json::json!({
+                            "kinds": [39000],
+                            "#d": &pending_owned_ids,
+                            "limit": pending_owned_ids.len(),
+                        })],
+                    )
+                    .await
+                }
+                DirectoryScope::MemberOnly => Ok(Vec::new()),
+            }
+        },
         // Step 6: NIP-DV hidden-DM snapshot. Tolerant — a failure means no DMs
         // are hidden rather than aborting the whole fetch.
         async {
@@ -259,7 +307,8 @@ async fn fetch_channels(state: &AppState) -> Result<Vec<ChannelInfo>, String> {
     let open_meta_events = open_meta_result?;
     // hidden_dms is already a resolved HashSet (tolerant path above)
 
-    // Merge: member channels (marked as member) + open channels (not yet joined).
+    // Merge: member channels (marked as member) + non-member channels (open
+    // directory when included, else pending-owned) not already in the member set.
     let member_d_tags: std::collections::HashSet<String> = meta_events
         .iter()
         .filter_map(|ev| {
@@ -390,7 +439,11 @@ async fn fetch_channels(state: &AppState) -> Result<Vec<ChannelInfo>, String> {
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
-/// Return the full channel list for the active identity.
+/// Return the channels the active identity belongs to (plus its own
+/// not-yet-propagated creations). This is the 60s poll path: it performs no
+/// all-open directory scan, so its phase-2 fan-out is bounded by membership.
+/// Joinable open channels are served separately by
+/// [`get_open_channel_directory`].
 ///
 /// `known_hash` is a previously returned `hash` value. When it matches the
 /// computed stable hash (which excludes `last_message_at`), the response
@@ -402,7 +455,7 @@ pub async fn get_channels(
     known_hash: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<GetChannelsPayload, String> {
-    let channels = fetch_channels(&state).await?;
+    let channels = fetch_channels(&state, DirectoryScope::MemberOnly).await?;
 
     let last_messages: std::collections::HashMap<String, String> = channels
         .iter()
@@ -431,6 +484,19 @@ pub async fn get_channels(
         channels: Some(channels),
         last_messages,
     })
+}
+
+/// Return the open-channel directory: every joinable open channel plus the
+/// identity's own channels, marked with `is_member`. This is the discovery
+/// superset that `get_channels` intentionally omits from the 60s poll — the
+/// channel browser and global search fetch it on demand (browse open / search
+/// active) with a generous staleTime, so the expensive all-open scan runs only
+/// when a user is actually looking for channels to join.
+#[tauri::command]
+pub async fn get_open_channel_directory(
+    state: State<'_, AppState>,
+) -> Result<Vec<ChannelInfo>, String> {
+    fetch_channels(&state, DirectoryScope::IncludeOpenDirectory).await
 }
 
 struct ChannelMembership {
@@ -711,7 +777,8 @@ pub async fn create_channel(
 pub async fn ensure_starter_channels(
     state: State<'_, AppState>,
 ) -> Result<Vec<ChannelInfo>, String> {
-    let mut existing_channels = fetch_channels(&state).await?;
+    let mut existing_channels =
+        fetch_channels(&state, DirectoryScope::IncludeOpenDirectory).await?;
     let relay_scope = relay_api_base_url_with_override(&state);
     let creator_keys = state.signing_keys()?;
     let creator_pubkey = creator_keys.public_key().to_hex();
@@ -770,7 +837,7 @@ pub async fn ensure_starter_channels(
     }
 
     if !has_all_starter_channels(&existing_channels) {
-        existing_channels = fetch_channels(&state).await?;
+        existing_channels = fetch_channels(&state, DirectoryScope::IncludeOpenDirectory).await?;
     }
 
     if !has_all_starter_channels(&existing_channels) {

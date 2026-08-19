@@ -285,6 +285,22 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// Channel ids `my_pubkey` created whose kind:39002 membership has not yet
+    /// been observed. The member-only channel poll unions these with the real
+    /// member set so a just-created channel stays visible without an all-open
+    /// directory scan (#1761).
+    pub fn pending_owned_channel_ids(&self, my_pubkey: &str) -> Vec<String> {
+        self.pending_owned_channels
+            .lock()
+            .map(|set| {
+                set.iter()
+                    .filter(|(owner, _)| owner == my_pubkey)
+                    .map(|(_, channel_id)| channel_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Drop the `(my_pubkey, channel_id)` entry from the pending-owner
     /// overlay once that identity's real kind:39002 membership has been
     /// observed.

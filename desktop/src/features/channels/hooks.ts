@@ -10,6 +10,7 @@ import {
   getChannelDetails,
   getChannelMembers,
   getChannels,
+  getOpenChannelDirectory,
   hideDm,
   joinChannel,
   leaveChannel,
@@ -43,6 +44,15 @@ import {
 } from "@/features/channels/channelSnapshot";
 
 export const channelsQueryKey = ["channels"] as const;
+/**
+ * Discovery superset: every joinable open channel plus this identity's own
+ * channels. Distinct from {@link channelsQueryKey} (member-only) so the browser
+ * and search can hold the wider list without it entering the 60s poll cache.
+ */
+export const openChannelDirectoryQueryKey = [
+  "channels",
+  "open-directory",
+] as const;
 /** Keeps focused polling at the established one-minute cadence. */
 export const CHANNELS_REFETCH_INTERVAL_MS = 60_000;
 /** Suppresses the expensive focus refetch until the channel list is old. */
@@ -449,6 +459,60 @@ export function useChannelsQuery(options?: { enabled?: boolean }) {
   ]);
 
   return query;
+}
+
+/** Suppresses redundant directory scans while a browse/search session is open. */
+export const OPEN_CHANNEL_DIRECTORY_STALE_TIME_MS = 5 * 60_000;
+
+/**
+ * Reconstructs the pre-split merged shape: the member list (authoritative for
+ * shared ids, since it carries optimistic mutations and poll timestamps) plus
+ * every open channel the member list omits. Callers feed this to the discovery
+ * surfaces so no non-member open channel is silently lost when the directory is
+ * fetched separately from the 60s poll. Exported for regression coverage.
+ */
+export function mergeOpenChannelDirectory(
+  memberChannels: Channel[],
+  directoryChannels: Channel[] | undefined,
+): Channel[] {
+  if (!directoryChannels || directoryChannels.length === 0) {
+    return memberChannels;
+  }
+  const memberIds = new Set(memberChannels.map((channel) => channel.id));
+  const directoryOnly = directoryChannels.filter(
+    (channel) => !memberIds.has(channel.id),
+  );
+  return directoryOnly.length === 0
+    ? memberChannels
+    : sortChannels([...memberChannels, ...directoryOnly]);
+}
+
+/**
+ * Fetches the open-channel directory on demand — the discovery superset that
+ * `useChannelsQuery` intentionally omits from the 60s poll. Callers pass
+ * `enabled` so the unbounded all-open relay scan runs only while the channel
+ * browser is open or a global search is active.
+ *
+ * The key nests under `["channels"]`, so channel mutations that invalidate the
+ * member list (join, leave, archive) also refresh a mounted directory. When no
+ * consumer is mounted the invalidation only marks it stale, deferring the scan
+ * until it is next needed.
+ */
+export function useOpenChannelDirectoryQuery(options?: { enabled?: boolean }) {
+  const { activeCommunity } = useCommunities();
+  const relayUrl = activeCommunity?.relayUrl ?? null;
+  const identityQuery = useIdentityQuery();
+  const ownerPubkey = identityQuery.data?.pubkey ?? null;
+
+  return useQuery({
+    enabled:
+      (options?.enabled ?? true) &&
+      relayUrl !== null &&
+      canFetchChannelsForIdentity(ownerPubkey, identityQuery.isError),
+    queryKey: openChannelDirectoryQueryKey,
+    queryFn: async () => sortChannels(await getOpenChannelDirectory()),
+    staleTime: OPEN_CHANNEL_DIRECTORY_STALE_TIME_MS,
+  });
 }
 
 export function useCreateChannelMutation() {
