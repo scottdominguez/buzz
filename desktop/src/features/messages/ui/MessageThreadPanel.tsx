@@ -31,6 +31,10 @@ import {
 } from "@/features/messages/lib/messageThreadPanelLayout";
 import { Button } from "@/shared/ui/button";
 import { Separator } from "@/shared/ui/separator";
+import {
+  type ListVirtualizer,
+  VirtualizedList,
+} from "@/shared/ui/VirtualizedList";
 import { ComposerActivityAccessory } from "./ComposerActivityAccessory";
 import { ComposerDockBackdrop } from "./ComposerDockBackdrop";
 import { MessageComposer } from "./MessageComposer";
@@ -47,6 +51,10 @@ import { useComposerHeightPadding } from "./useComposerHeightPadding";
 import { useStableSendToChannel } from "./useStableSendToChannel";
 import { useAnchoredScroll } from "./useAnchoredScroll";
 import { selectDeferredListRenderState } from "@/features/messages/lib/timelineSnapshot";
+import {
+  createMessageIndex,
+  scrollVirtualizedMessageIntoView,
+} from "./conversationVirtualization";
 
 type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   channel: Channel | null;
@@ -250,6 +258,9 @@ export function MessageThreadPanel({
   const threadBodyRef = React.useRef<HTMLDivElement>(null);
   const threadContentRef = React.useRef<HTMLDivElement>(null);
   const threadComposerWrapperRef = React.useRef<HTMLDivElement>(null);
+  const threadRepliesVirtualizerRef = React.useRef<ListVirtualizer | null>(
+    null,
+  );
   const [hoveredCollapseBranchId, setHoveredCollapseBranchId] = React.useState<
     string | null
   >(null);
@@ -382,6 +393,26 @@ export function MessageThreadPanel({
   const threadMessages = React.useMemo(
     () => deferredThreadReplies.map((entry) => entry.message),
     [deferredThreadReplies],
+  );
+  const threadReplyIndexById = React.useMemo(
+    () => createMessageIndex(threadMessages),
+    [threadMessages],
+  );
+  const handleThreadRepliesVirtualizer = React.useCallback(
+    (virtualizer: ListVirtualizer) => {
+      threadRepliesVirtualizerRef.current = virtualizer;
+    },
+    [],
+  );
+  const virtualScrollToThreadReply = React.useCallback(
+    (messageId: string, options?: { behavior?: ScrollBehavior }) =>
+      scrollVirtualizedMessageIntoView(
+        threadRepliesVirtualizerRef.current,
+        threadReplyIndexById,
+        messageId,
+        options?.behavior,
+      ),
+    [threadReplyIndexById],
   );
   const shouldShowThreadBranchGuides = React.useMemo(
     () => hasNestedThreadBranches(deferredThreadReplies),
@@ -522,6 +553,7 @@ export function MessageThreadPanel({
     pinTargetCentered: !scrollTargetHighlights,
     scrollContainerRef: threadBodyRef,
     targetMessageId: scrollTargetId,
+    virtualScrollToMessage: virtualScrollToThreadReply,
   });
   useComposerHeightPadding(
     threadBodyRef,
@@ -659,151 +691,167 @@ export function MessageThreadPanel({
                 className="space-y-0"
                 data-render-pending={isRepliesPending ? "true" : undefined}
               >
-                {threadReplyRenderItems.map((item) => {
-                  const {
-                    collapseDepthGuideActions,
-                    connectsToVisibleChild,
-                    continuationDepths,
-                    entry,
-                    index,
-                    isContinuation,
-                  } = item;
-                  const showUnreadDivider =
-                    index > 0 && entry.message.id === firstUnreadReplyId;
-                  const isHighlightedBranchOwner =
-                    highlightedBranch?.id === entry.message.id;
-                  const isInsideHighlightedBranch =
-                    highlightedBranch != null &&
-                    index > highlightedBranch.startIndex &&
-                    index <= highlightedBranch.endIndex;
-                  const isDirectChildOfHighlightedBranch =
-                    isInsideHighlightedBranch &&
-                    highlightedBranch != null &&
-                    index > highlightedBranch.startIndex &&
-                    index <= highlightedBranch.endIndex &&
-                    entry.message.depth === highlightedBranch.depth + 1;
-                  const highlightedLineDepths =
-                    shouldShowThreadBranchGuides &&
-                    isInsideHighlightedBranch &&
-                    highlightedBranch
-                      ? [highlightedBranch.depth]
-                      : undefined;
-                  return (
-                    <div
-                      className={cn(
-                        "flex flex-col gap-0",
-                        entry.summary &&
-                          "group/message rounded-2xl px-0 py-0.5 transition-colors hover:bg-muted/50 focus-within:bg-muted/50",
-                      )}
-                      key={entry.message.renderKey ?? entry.message.id}
-                    >
-                      {showUnreadDivider ? <UnreadDivider /> : null}
-                      <MessageThreadRow
-                        channelId={channelId}
-                        currentPubkey={currentPubkey}
-                        collapseDepthGuideActions={collapseDepthGuideActions}
-                        collapseDescendantsLabel="Collapse replies"
-                        connectDescendants={
-                          shouldShowThreadBranchGuides && connectsToVisibleChild
-                        }
-                        depthGuideDepths={
-                          shouldShowThreadBranchGuides
-                            ? continuationDepths
-                            : undefined
-                        }
-                        highlightDescendantRail={
-                          shouldShowThreadBranchGuides &&
-                          isHighlightedBranchOwner &&
-                          connectsToVisibleChild
-                        }
-                        highlightReplyConnector={
-                          shouldShowThreadBranchGuides &&
-                          isDirectChildOfHighlightedBranch
-                        }
-                        highlightThreadLineDepths={highlightedLineDepths}
-                        hoverBackground={!entry.summary}
-                        huddleMemberPubkeys={huddleMemberPubkeys}
-                        huddleMemberPubkeysPending={huddleMemberPubkeysPending}
-                        isContinuation={isContinuation}
-                        isUnread={isMessageUnreadById?.(entry.message.id)}
-                        message={entry.message}
-                        onCollapseDepthGuide={handleCollapseDepthGuide}
-                        onCollapseDepthGuideHoverChange={
-                          handleCollapseBranchHoverChange
-                        }
-                        onCollapseDescendants={
-                          shouldShowThreadBranchGuides &&
-                          connectsToVisibleChild &&
-                          !entry.summary
-                            ? onExpandReplies
-                            : undefined
-                        }
-                        onCollapseDescendantsHoverChange={
-                          handleCollapseBranchHoverChange
-                        }
-                        onDelete={
-                          onDelete &&
-                          canManageMessageForCurrentUser(
-                            entry.message,
-                            currentPubkey,
-                            profiles,
-                          )
-                            ? onDelete
-                            : undefined
-                        }
-                        onEdit={
-                          onEdit &&
-                          canManageMessageForCurrentUser(
-                            entry.message,
-                            currentPubkey,
-                            profiles,
-                          )
-                            ? onEdit
-                            : undefined
-                        }
-                        onMarkUnread={onMarkUnread}
-                        onMarkRead={onMarkRead}
-                        onReply={onSelectReplyTarget}
-                        onSendToChannel={stableSendToChannel}
-                        onToggleReaction={onToggleReaction}
-                        profiles={profiles}
-                        showDepthGuides={shouldShowThreadBranchGuides}
-                        videoReviewCommentRootId={videoReviewPresentation?.commentRootIdsByMessageId.get(
-                          entry.message.id,
+                <VirtualizedList
+                  estimateSize={112}
+                  getItemKey={(item) =>
+                    item.entry.message.renderKey ?? item.entry.message.id
+                  }
+                  items={threadReplyRenderItems}
+                  onVirtualizer={handleThreadRepliesVirtualizer}
+                  overscan={8}
+                  renderItem={(item) => {
+                    const {
+                      collapseDepthGuideActions,
+                      connectsToVisibleChild,
+                      continuationDepths,
+                      entry,
+                      index,
+                      isContinuation,
+                    } = item;
+                    const showUnreadDivider =
+                      index > 0 && entry.message.id === firstUnreadReplyId;
+                    const isHighlightedBranchOwner =
+                      highlightedBranch?.id === entry.message.id;
+                    const isInsideHighlightedBranch =
+                      highlightedBranch != null &&
+                      index > highlightedBranch.startIndex &&
+                      index <= highlightedBranch.endIndex;
+                    const isDirectChildOfHighlightedBranch =
+                      isInsideHighlightedBranch &&
+                      highlightedBranch != null &&
+                      index > highlightedBranch.startIndex &&
+                      index <= highlightedBranch.endIndex &&
+                      entry.message.depth === highlightedBranch.depth + 1;
+                    const highlightedLineDepths =
+                      shouldShowThreadBranchGuides &&
+                      isInsideHighlightedBranch &&
+                      highlightedBranch
+                        ? [highlightedBranch.depth]
+                        : undefined;
+                    return (
+                      <div
+                        className={cn(
+                          "flex flex-col gap-0",
+                          entry.summary &&
+                            "group/message rounded-2xl px-0 py-0.5 transition-colors hover:bg-muted/50 focus-within:bg-muted/50",
                         )}
-                        videoReviewContext={videoReviewPresentation?.contextsByMessageId.get(
-                          entry.message.id,
-                        )}
-                      />
-                      {entry.summary ? (
-                        <MessageThreadSummaryRow
+                        key={entry.message.renderKey ?? entry.message.id}
+                      >
+                        {showUnreadDivider ? <UnreadDivider /> : null}
+                        <MessageRow
+                          channelId={channelId}
+                          currentPubkey={currentPubkey}
                           collapseDepthGuideActions={collapseDepthGuideActions}
-                          depth={entry.message.depth}
+                          collapseDescendantsLabel="Collapse replies"
+                          connectDescendants={
+                            shouldShowThreadBranchGuides &&
+                            connectsToVisibleChild
+                          }
                           depthGuideDepths={
                             shouldShowThreadBranchGuides
                               ? continuationDepths
                               : undefined
                           }
+                          highlightDescendantRail={
+                            shouldShowThreadBranchGuides &&
+                            isHighlightedBranchOwner &&
+                            connectsToVisibleChild
+                          }
+                          highlightReplyConnector={
+                            shouldShowThreadBranchGuides &&
+                            isDirectChildOfHighlightedBranch
+                          }
                           highlightThreadLineDepths={highlightedLineDepths}
+                          hoverBackground={!entry.summary}
+                          huddleMemberPubkeys={huddleMemberPubkeys}
+                          huddleMemberPubkeysPending={
+                            huddleMemberPubkeysPending
+                          }
+                          isContinuation={isContinuation}
+                          isUnread={isMessageUnreadById?.(entry.message.id)}
+                          layoutVariant="thread-reply"
                           message={entry.message}
                           onCollapseDepthGuide={handleCollapseDepthGuide}
                           onCollapseDepthGuideHoverChange={
                             handleCollapseBranchHoverChange
                           }
-                          onOpenThread={onExpandReplies}
-                          summary={entry.summary}
-                          summaryIndentOffsetRem={
-                            THREAD_PANEL_SUMMARY_INDENT_OFFSET_REM
+                          onCollapseDescendants={
+                            shouldShowThreadBranchGuides &&
+                            connectsToVisibleChild &&
+                            !entry.summary
+                              ? onExpandReplies
+                              : undefined
                           }
+                          onCollapseDescendantsHoverChange={
+                            handleCollapseBranchHoverChange
+                          }
+                          onDelete={
+                            onDelete &&
+                            canManageMessageForCurrentUser(
+                              entry.message,
+                              currentPubkey,
+                              profiles,
+                            )
+                              ? onDelete
+                              : undefined
+                          }
+                          onEdit={
+                            onEdit &&
+                            canManageMessageForCurrentUser(
+                              entry.message,
+                              currentPubkey,
+                              profiles,
+                            )
+                              ? onEdit
+                              : undefined
+                          }
+                          onMarkUnread={onMarkUnread}
+                          onMarkRead={onMarkRead}
+                          onReply={onSelectReplyTarget}
+                          onSendToChannel={stableSendToChannel}
+                          onToggleReaction={onToggleReaction}
+                          profiles={profiles}
                           showDepthGuides={shouldShowThreadBranchGuides}
-                          unreadCount={threadReplyUnreadCounts?.get(
+                          videoReviewCommentRootId={videoReviewPresentation?.commentRootIdsByMessageId.get(
+                            entry.message.id,
+                          )}
+                          videoReviewContext={videoReviewPresentation?.contextsByMessageId.get(
                             entry.message.id,
                           )}
                         />
-                      ) : null}
-                    </div>
-                  );
-                })}
+                        {entry.summary ? (
+                          <MessageThreadSummaryRow
+                            collapseDepthGuideActions={
+                              collapseDepthGuideActions
+                            }
+                            depth={entry.message.depth}
+                            depthGuideDepths={
+                              shouldShowThreadBranchGuides
+                                ? continuationDepths
+                                : undefined
+                            }
+                            highlightThreadLineDepths={highlightedLineDepths}
+                            message={entry.message}
+                            onCollapseDepthGuide={handleCollapseDepthGuide}
+                            onCollapseDepthGuideHoverChange={
+                              handleCollapseBranchHoverChange
+                            }
+                            onOpenThread={onExpandReplies}
+                            summary={entry.summary}
+                            summaryIndentOffsetRem={
+                              THREAD_PANEL_SUMMARY_INDENT_OFFSET_REM
+                            }
+                            showDepthGuides={shouldShowThreadBranchGuides}
+                            unreadCount={threadReplyUnreadCounts?.get(
+                              entry.message.id,
+                            )}
+                          />
+                        ) : null}
+                      </div>
+                    );
+                  }}
+                  scrollRef={threadBodyRef}
+                />
               </div>
             )
           ) : repliesRenderState === "empty" && !isHuddleTranscript ? (

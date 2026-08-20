@@ -52,6 +52,14 @@ import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { VideoReviewNavigationProvider } from "@/shared/ui/VideoReviewNavigation";
 import {
+  type ListVirtualizer,
+  VirtualizedList,
+} from "@/shared/ui/VirtualizedList";
+import {
+  createMessageIndex,
+  scrollVirtualizedMessageIntoView,
+} from "@/features/messages/ui/conversationVirtualization";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -198,6 +206,7 @@ function InboxMessageDetailPane({
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
   const contentRef = React.useRef<HTMLDivElement | null>(null);
   const composerWrapperRef = React.useRef<HTMLDivElement | null>(null);
+  const messageVirtualizerRef = React.useRef<ListVirtualizer | null>(null);
   const [replyTargetId, setReplyTargetId] = React.useState<string | null>(null);
   const [isFocusHighlightVisible, setIsFocusHighlightVisible] =
     React.useState(true);
@@ -253,6 +262,26 @@ function InboxMessageDetailPane({
   const videoReviewMessages = React.useMemo(
     () => displayMessages.map(toTimelineMessage),
     [displayMessages],
+  );
+  const messageIndexById = React.useMemo(
+    () => createMessageIndex(displayMessages),
+    [displayMessages],
+  );
+  const handleMessageVirtualizer = React.useCallback(
+    (virtualizer: ListVirtualizer) => {
+      messageVirtualizerRef.current = virtualizer;
+    },
+    [],
+  );
+  const virtualScrollToMessage = React.useCallback(
+    (messageId: string, options?: { behavior?: ScrollBehavior }) =>
+      scrollVirtualizedMessageIntoView(
+        messageVirtualizerRef.current,
+        messageIndexById,
+        messageId,
+        options?.behavior,
+      ),
+    [messageIndexById],
   );
   const videoReviewChannelType =
     item?.item.channelType === "dm" ||
@@ -313,6 +342,7 @@ function InboxMessageDetailPane({
     pinTargetCentered: true,
     scrollContainerRef,
     targetMessageId: selectedEventId,
+    virtualScrollToMessage,
   });
 
   const focusComposer = React.useCallback(() => {
@@ -664,68 +694,76 @@ function InboxMessageDetailPane({
                 <span>Some message context could not be loaded.</span>
               </div>
             ) : null}
-            {displayMessages.map((message, index) => {
-              const hasUnreadBoundary = message.id === unreadBoundaryEventId;
-              const isAfterSeparator = index === 1 || hasUnreadBoundary;
-              const previousMessage = displayMessages[index - 1];
-              const isContinuation =
-                !isAfterSeparator &&
-                !startsNewMessageGroup(message) &&
-                hasSameMessageAuthor(
-                  { pubkey: previousMessage?.authorPubkey },
-                  { pubkey: message.authorPubkey },
-                ) &&
-                isWithinGroupingWindow(
-                  previousMessage?.createdAt,
-                  message.createdAt,
+            <VirtualizedList
+              estimateSize={112}
+              getItemKey={(message) => message.id}
+              items={displayMessages}
+              onVirtualizer={handleMessageVirtualizer}
+              overscan={8}
+              renderItem={(message, index) => {
+                const hasUnreadBoundary = message.id === unreadBoundaryEventId;
+                const isAfterSeparator = index === 1 || hasUnreadBoundary;
+                const previousMessage = displayMessages[index - 1];
+                const isContinuation =
+                  !isAfterSeparator &&
+                  !startsNewMessageGroup(message) &&
+                  hasSameMessageAuthor(
+                    { pubkey: previousMessage?.authorPubkey },
+                    { pubkey: message.authorPubkey },
+                  ) &&
+                  isWithinGroupingWindow(
+                    previousMessage?.createdAt,
+                    message.createdAt,
+                  );
+
+                const canManageMessage = canManageMessageForCurrentUser(
+                  {
+                    id: message.id,
+                    author: message.authorLabel,
+                    body: message.content,
+                    createdAt: message.createdAt,
+                    depth: message.depth,
+                    kind: message.kind,
+                    pubkey: message.authorPubkey,
+                    time: message.timeLabel ?? message.fullTimestampLabel,
+                  },
+                  currentPubkey,
+                  profiles,
                 );
 
-              const canManageMessage = canManageMessageForCurrentUser(
-                {
-                  id: message.id,
-                  author: message.authorLabel,
-                  body: message.content,
-                  createdAt: message.createdAt,
-                  depth: message.depth,
-                  kind: message.kind,
-                  pubkey: message.authorPubkey,
-                  time: message.timeLabel ?? message.fullTimestampLabel,
-                },
-                currentPubkey,
-                profiles,
-              );
+                const canEditMessage =
+                  channel?.archivedAt === null && canManageMessage;
 
-              const canEditMessage =
-                channel?.archivedAt === null && canManageMessage;
-
-              return (
-                <InboxMessageRow
-                  agentPubkeys={agentPubkeys}
-                  canReply={canReply}
-                  channelId={item.item.channelId}
-                  isContinuation={isContinuation}
-                  isFirst={index === 0}
-                  isFocusHighlightVisible={isFocusHighlightVisible}
-                  key={message.id}
-                  message={message}
-                  onDelete={
-                    canEditMessage
-                      ? () => onDeleteMessage(message.id)
-                      : undefined
-                  }
-                  onEdit={canEditMessage ? handleSelectEditTarget : undefined}
-                  onSelectReplyTarget={handleSelectReplyTarget}
-                  onToggleReaction={onToggleReaction}
-                  showUnreadBoundary={hasUnreadBoundary}
-                  videoReviewCommentRootId={videoReviewPresentation.commentRootIdsByMessageId.get(
-                    message.id,
-                  )}
-                  videoReviewContext={videoReviewPresentation.contextsByMessageId.get(
-                    message.id,
-                  )}
-                />
-              );
-            })}
+                return (
+                  <InboxMessageRow
+                    agentPubkeys={agentPubkeys}
+                    canReply={canReply}
+                    channelId={item.item.channelId}
+                    isContinuation={isContinuation}
+                    isFirst={index === 0}
+                    isFocusHighlightVisible={isFocusHighlightVisible}
+                    key={message.id}
+                    message={message}
+                    onDelete={
+                      canEditMessage
+                        ? () => onDeleteMessage(message.id)
+                        : undefined
+                    }
+                    onEdit={canEditMessage ? handleSelectEditTarget : undefined}
+                    onSelectReplyTarget={handleSelectReplyTarget}
+                    onToggleReaction={onToggleReaction}
+                    showUnreadBoundary={hasUnreadBoundary}
+                    videoReviewCommentRootId={videoReviewPresentation.commentRootIdsByMessageId.get(
+                      message.id,
+                    )}
+                    videoReviewContext={videoReviewPresentation.contextsByMessageId.get(
+                      message.id,
+                    )}
+                  />
+                );
+              }}
+              scrollRef={scrollContainerRef}
+            />
           </div>
         </div>
 
