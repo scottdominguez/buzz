@@ -79,6 +79,7 @@ async function loadThreadReplies(
   queryClient: QueryClient,
   channelId: string,
   rootId: string,
+  signal?: AbortSignal,
 ): Promise<RelayEvent[]> {
   const queryKey = threadRepliesKey(channelId, rootId);
   const cacheAtStart = queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
@@ -86,13 +87,16 @@ async function loadThreadReplies(
   const replies: RelayEvent[] = [];
   let cursor: ThreadCursor | null = null;
   for (let page = 0; page < MAX_THREAD_PAGES; page += 1) {
+    signal?.throwIfAborted();
     const response = await getThreadReplies(rootId, channelId, {
       limit: THREAD_PAGE_LIMIT,
       cursor,
     });
+    signal?.throwIfAborted();
     replies.push(...response.events);
     if (!response.nextCursor) {
       const fetched = await withThreadAux(channelId, rootId, replies);
+      signal?.throwIfAborted();
       const current = queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
       const receivedInFlight = current.filter(
         (event) => !idsAtStart.has(event.id),
@@ -119,12 +123,17 @@ export function useThreadReplies(
       activeChannel !== null &&
       activeChannel.channelType !== "forum" &&
       openThreadRootId !== null,
-    queryFn: async (): Promise<RelayEvent[]> => {
+    queryFn: async ({ signal }): Promise<RelayEvent[]> => {
       if (!activeChannel || !openThreadRootId) return [];
-      return loadThreadReplies(queryClient, activeChannel.id, openThreadRootId);
+      return loadThreadReplies(
+        queryClient,
+        activeChannel.id,
+        openThreadRootId,
+        signal,
+      );
     },
     staleTime: 0,
-    gcTime: 60 * 60 * 1_000,
+    gcTime: 5 * 60 * 1_000,
   });
 }
 
@@ -144,9 +153,10 @@ export function useThreadRepliesForRoots(
     queries: rootIds.map((rootId) => ({
       queryKey: threadRepliesKey(channelId, rootId),
       enabled: activeChannel !== null && activeChannel.channelType !== "forum",
-      queryFn: () => loadThreadReplies(queryClient, channelId, rootId),
+      queryFn: ({ signal }: { signal: AbortSignal }) =>
+        loadThreadReplies(queryClient, channelId, rootId, signal),
       staleTime: 0,
-      gcTime: 60 * 60 * 1_000,
+      gcTime: 5 * 60 * 1_000,
     })),
     combine: (results) => ({
       events: sortMessages(results.flatMap((result) => result.data ?? [])),
