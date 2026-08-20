@@ -130,6 +130,10 @@ jobs:
             !desktop/src-tauri/target/**/release/bundle
           key: ${{ steps.rust_cache_key.outputs.key }}
 
+      - name: Purge stale bundle outputs
+        shell: bash
+        run: rm -rf "desktop/src-tauri/target/${TARGET}/release/bundle"
+
       - name: Generate non-updating bundle config
         shell: bash
         run: |
@@ -156,12 +160,20 @@ jobs:
       - name: Locate NSIS installer
         id: artifact
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle"
-          EXE=$(find "$BUNDLE_DIR/nsis" -name '*.exe' -type f | head -1)
-          if [[ -z "$EXE" ]]; then
-            echo "::error::No NSIS installer found in $BUNDLE_DIR/nsis"
+          mapfile -t EXES < <(find "$BUNDLE_DIR/nsis" -name '*.exe' -type f)
+          if [[ "${#EXES[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one NSIS installer in $BUNDLE_DIR/nsis; found ${#EXES[@]}"
+            printf '%s\n' "${EXES[@]}"
+            exit 1
+          fi
+          EXE="${EXES[0]}"
+          if [[ "$(basename "$EXE")" != *"${VERSION}"* ]]; then
+            echo "::error::Installer $(basename "$EXE") does not contain expected version $VERSION"
             exit 1
           fi
           echo "exe=$EXE" >> "$GITHUB_OUTPUT"
