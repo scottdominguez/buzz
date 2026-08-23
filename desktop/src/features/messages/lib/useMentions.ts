@@ -241,10 +241,7 @@ export function useMentions(
   });
   const mentionProfiles = React.useMemo(
     () =>
-      mergeMentionProfileLookups(
-        memberProfilesQuery.data?.profiles,
-        profiles,
-      ),
+      mergeMentionProfileLookups(memberProfilesQuery.data?.profiles, profiles),
     [memberProfilesQuery.data?.profiles, profiles],
   );
   const agentIdentityPubkeys = React.useMemo(

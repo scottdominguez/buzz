@@ -42,7 +42,7 @@ import {
   MessageThreadPanelHeader,
   ThreadMessageSkeleton,
 } from "./MessageThreadPanelSkeleton";
-import type { ThreadDepthGuideAction } from "./MessageRow";
+import { MessageRow, type ThreadDepthGuideAction } from "./MessageRow";
 import { MessageThreadRow } from "./MessageThreadRow";
 import { MessageThreadSummaryRow } from "./MessageThreadSummaryRow";
 import { TypingIndicatorRow } from "./TypingIndicatorRow";
