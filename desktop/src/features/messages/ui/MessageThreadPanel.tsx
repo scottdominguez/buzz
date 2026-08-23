@@ -1,11 +1,7 @@
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
-import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleTranscriptIntro } from "@/features/huddle/components/HuddleTranscriptIntro";
-import { orderMentionPubkeysByText } from "@/features/messages/lib/orderMentionPubkeys";
-import { normalizePubkey } from "@/shared/lib/pubkey";
-import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import {
   buildThreadSummaryFromVisibleEntries,
   hasNestedThreadBranches,
@@ -47,6 +43,7 @@ import {
   ThreadMessageSkeleton,
 } from "./MessageThreadPanelSkeleton";
 import { MessageRow, type ThreadDepthGuideAction } from "./MessageRow";
+import { MessageThreadRow } from "./MessageThreadRow";
 import { MessageThreadSummaryRow } from "./MessageThreadSummaryRow";
 import { TypingIndicatorRow } from "./TypingIndicatorRow";
 import { UnreadDivider } from "./UnreadDivider";
@@ -565,29 +562,6 @@ export function MessageThreadPanel({
     "padding",
     settleAtBottomAfterLayout,
   );
-  const knownAgentPubkeys = useKnownAgentPubkeys();
-  const initialAgentPubkeys = React.useMemo(() => {
-    if (
-      !threadHead ||
-      !currentPubkey ||
-      normalizePubkey(threadHead.signerPubkey ?? threadHead.pubkey ?? "") !==
-        normalizePubkey(currentPubkey)
-    ) {
-      return [];
-    }
-    const { mentionPubkeysByName } = resolveMentionProps(
-      threadHead.tags,
-      profiles,
-    );
-    if (!mentionPubkeysByName) return [];
-
-    return orderMentionPubkeysByText(
-      threadHead.body,
-      mentionPubkeysByName,
-      (pubkey) =>
-        knownAgentPubkeys.has(pubkey) || profiles?.[pubkey]?.isAgent === true,
-    );
-  }, [currentPubkey, knownAgentPubkeys, profiles, threadHead]);
   const stableSendToChannel = useStableSendToChannel(
     channelId,
     threadHead,
@@ -623,7 +597,7 @@ export function MessageThreadPanel({
             data-testid="message-thread-head"
           >
             <div className="rounded-2xl">
-              <MessageRow
+              <MessageThreadRow
                 actionBarPlacement="inside"
                 channelId={channelId}
                 currentPubkey={currentPubkey}
@@ -631,7 +605,6 @@ export function MessageThreadPanel({
                 huddleMemberPubkeysPending={huddleMemberPubkeysPending}
                 isFollowingThread={isFollowingThread}
                 isUnread={isMessageUnreadById?.(threadHead.id)}
-                layoutVariant="thread-reply"
                 message={threadHead}
                 onDelete={
                   onDelete &&
@@ -941,11 +914,7 @@ export function MessageThreadPanel({
           >
             <ComposerDockBackdrop gutterClassName="inset-x-5" />
             <MessageComposer
-              audienceContext={{
-                type: "thread",
-                threadRootId: threadHead.id,
-                initialAgentPubkeys,
-              }}
+              audienceContext={{ type: "thread" }}
               channelId={channelId}
               channelName={channelName}
               channelType={channel?.channelType ?? null}
