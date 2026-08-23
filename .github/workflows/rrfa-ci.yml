@@ -1,0 +1,65 @@
+name: RRFA Fork CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rrfa-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop patch gate
+    if: github.repository == 'scottdominguez/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - run: pnpm install --frozen-lockfile
+      - name: Focused RRFA regressions
+        working-directory: desktop
+        run: >-
+          node --import ./test-loader.mjs --experimental-strip-types --test
+          src/features/messages/ui/conversationVirtualization.test.mjs
+          src/features/messages/lib/mentionProfileLookup.test.mjs
+      - name: Desktop tests
+        run: pnpm --dir desktop test
+      - name: TypeScript
+        run: pnpm --dir desktop typecheck
+      - name: Biome
+        working-directory: desktop
+        run: >-
+          pnpm exec biome check
+          src/features/home/ui/InboxDetailPane.tsx
+          src/features/messages/ui/MessageThreadPanel.tsx
+          src/features/messages/useThreadReplies.ts
+          src/features/messages/ui/conversationVirtualization.ts
+          src/features/messages/ui/conversationVirtualization.test.mjs
+          src/features/messages/lib/useMentions.ts
+          src/features/messages/lib/mentionProfileLookup.ts
+          src/features/messages/lib/mentionProfileLookup.test.mjs
+      - name: Production build
+        run: pnpm --dir desktop build
+
+  windows-rust:
+    name: Windows Rust gate
+    if: github.repository == 'scottdominguez/buzz'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Tauri Rust check
+        working-directory: desktop/src-tauri
+        run: cargo check --locked
