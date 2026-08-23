@@ -59,7 +59,23 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+          key: rrfa-windows-msvc
+          save-if: false
+      - name: Create sidecar placeholders
+        shell: bash
+        env:
+          TARGET: x86_64-pc-windows-msvc
+        run: |
+          mkdir -p desktop/src-tauri/binaries
+          for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+            touch "desktop/src-tauri/binaries/${bin}-${TARGET}.exe"
+          done
       - name: Tauri Rust check
-        working-directory: desktop/src-tauri
-        run: cargo check --locked
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml --workspace --all-targets --target x86_64-pc-windows-msvc
