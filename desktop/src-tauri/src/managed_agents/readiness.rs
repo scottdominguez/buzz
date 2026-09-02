@@ -435,12 +435,18 @@ fn collect_missing_requirements(
             let file_cfg = read_goose_file_config();
             goose_requirements(effective, file_cfg.as_ref())
         }
-        "claude" => cli_login::requirements(
+        "claude" => cli_login::requirements_with_env(
             &["claude", "auth", "status"],
             "complete Claude Code authentication by running the Claude CLI",
             rt,
+            &effective.env,
         ),
-        "codex" => cli_login::requirements(&["codex", "login", "status"], "run `codex login`", rt),
+        "codex" => cli_login::requirements_with_env(
+            &["codex", "login", "status"],
+            "run `codex login`",
+            rt,
+            &effective.env,
+        ),
         _ => vec![],
     }
 }
