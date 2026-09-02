@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use crate::managed_agents::{
     discovery::{
@@ -15,6 +15,16 @@ pub(super) fn requirements(
     probe_args: &[&str],
     setup_copy: &str,
     runtime: &KnownAcpRuntime,
+) -> Vec<Requirement> {
+    requirements_with_env(probe_args, setup_copy, runtime, &BTreeMap::new())
+}
+
+/// Requirements using the exact effective environment passed to the harness.
+pub(super) fn requirements_with_env(
+    probe_args: &[&str],
+    setup_copy: &str,
+    runtime: &KnownAcpRuntime,
+    effective_env: &BTreeMap<String, String>,
 ) -> Vec<Requirement> {
     let adapter_result = runtime
         .commands
@@ -47,7 +57,12 @@ pub(super) fn requirements(
                 )];
             };
             let augmented_path = cli_probe::augmented_path();
-            match cli_probe::login_probe(&binary_path, probe_args, augmented_path.as_deref()) {
+            match cli_probe::login_probe(
+                &binary_path,
+                probe_args,
+                augmented_path.as_deref(),
+                effective_env,
+            ) {
                 cli_probe::ProbeOutcome::LoggedIn => vec![],
                 cli_probe::ProbeOutcome::LoggedOut => vec![missing_requirement(
                     probe_args,

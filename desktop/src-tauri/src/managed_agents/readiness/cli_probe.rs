@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use crate::managed_agents::runtime::build_augmented_path;
 
@@ -57,9 +57,11 @@ pub(crate) fn login_probe(
     binary_path: &Path,
     probe_args: &[&str],
     augmented_path: Option<&str>,
+    effective_env: &BTreeMap<String, String>,
 ) -> ProbeOutcome {
     let mut command = std::process::Command::new(binary_path);
     command.args(&probe_args[1..]);
+    command.envs(effective_env);
     if let Some(path) = augmented_path {
         command.env("PATH", path);
     }
@@ -154,6 +156,7 @@ mod tests {
                 &script_path,
                 &["fake-codex", "login", "status"],
                 Some(&augmented_path),
+                &std::collections::BTreeMap::new(),
             ),
             ProbeOutcome::LoggedIn,
             "the injected augmented PATH should allow /usr/bin/env to find the interpreter"
@@ -161,6 +164,37 @@ mod tests {
         assert!(
             marker_path.exists(),
             "the fake node from the injected PATH should have run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_probe_uses_effective_auth_environment() {
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script_path = temp.path().join("fake-claude");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ntest \"$CLAUDE_CONFIG_DIR\" = '/agent/claude-home'\n",
+        )
+        .expect("write script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        let effective_env = BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/agent/claude-home".to_string(),
+        )]);
+
+        assert_eq!(
+            super::login_probe(
+                &script_path,
+                &["fake-claude", "auth", "status"],
+                None,
+                &effective_env,
+            ),
+            ProbeOutcome::LoggedIn,
         );
     }
 
@@ -187,6 +221,7 @@ mod tests {
             &script_path,
             &["fake-codex-bad-config", "login", "status"],
             None,
+            &std::collections::BTreeMap::new(),
         );
         assert!(
             matches!(outcome, ProbeOutcome::ConfigInvalid { .. }),
@@ -225,6 +260,7 @@ mod tests {
             &script_path,
             &["fake-codex-logged-out", "login", "status"],
             None,
+            &std::collections::BTreeMap::new(),
         );
         assert_eq!(
             outcome,
