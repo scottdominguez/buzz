@@ -2197,6 +2197,7 @@ async fn tokio_main() -> Result<()> {
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
+        require_reply: config.require_reply,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
@@ -3998,6 +3999,28 @@ fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
+            } else if let PromptOutcome::ReplyDeliveryFailed {
+                trigger_event_id,
+                recovery_attempts,
+                notice_published,
+                reason,
+            } = &result.outcome
+            {
+                // The original work succeeded and the same live ACP session
+                // already received its single delivery-only recovery prompt.
+                // Never put this batch through queue.requeue(): that would
+                // blindly repeat completed operational work. The pool posted
+                // a signed, exact-event terminal notice synchronously before
+                // returning this outcome; keep the non-success outcome visible
+                // in logs/observer telemetry before mark_complete below.
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    event_id = %trigger_event_id,
+                    recovery_attempts,
+                    notice_published,
+                    %reason,
+                    "reply delivery failed after bounded same-session recovery; original work was not replayed"
+                );
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -4038,6 +4061,7 @@ fn handle_prompt_result(
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
+        PromptOutcome::ReplyDeliveryFailed { .. } => "reply_delivery_failed",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
@@ -4197,6 +4221,30 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
+            pool.return_agent(result.agent);
+        }
+        PromptOutcome::ReplyDeliveryFailed {
+            trigger_event_id,
+            recovery_attempts,
+            notice_published,
+            reason,
+        } => {
+            let message = format!(
+                "reply delivery failed after {recovery_attempts} constrained recovery attempt(s) \
+                 for event {trigger_event_id}: {reason}; visible_notice_published={notice_published}"
+            );
+            emit_turn_error(&message, None);
+            tracing::error!(
+                agent = agent_index,
+                event_id = %trigger_event_id,
+                recovery_attempts,
+                notice_published,
+                %reason,
+                "agent_returned with terminal reply-delivery failure"
+            );
+            // ACP itself completed and remains usable. This is deliberately a
+            // failed outcome (not PromptOutcome::Ok), but respawning would lose
+            // the same-session evidence and would not improve relay delivery.
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
@@ -6781,6 +6829,7 @@ mod build_mcp_servers_tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            require_reply: false,
             memory_enabled: false,
             model: None,
             effort_level: None,
@@ -7005,6 +7054,7 @@ mod error_outcome_emission_tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            require_reply: false,
             memory_enabled: false,
             model: None,
             effort_level: None,
@@ -7765,6 +7815,107 @@ mod error_outcome_emission_tests {
         assert_eq!(
             events, 1,
             "hard-cap timeout with recent activity must preserve the event"
+        );
+    }
+
+    /// Reply-delivery failure must be terminal and visible: the completed batch
+    /// is NOT requeued (replaying it would repeat completed operational work),
+    /// exactly one `turn_error` observer frame is emitted, and the healthy ACP
+    /// process is returned to the pool instead of being respawned.
+    #[tokio::test]
+    async fn reply_delivery_failure_is_terminal_not_requeued_and_visible() {
+        let channel_id = Uuid::new_v4();
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let trigger_event_id = "f".repeat(64);
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::ReplyDeliveryFailed {
+                trigger_event_id: trigger_event_id.clone(),
+                recovery_attempts: 1,
+                notice_published: false,
+                reason: "proof absent".to_string(),
+            },
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+        );
+
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "ReplyDeliveryFailed must not requeue the completed batch"
+        );
+        assert_eq!(
+            queue.queued_event_count(&channel_id),
+            0,
+            "ReplyDeliveryFailed must not re-run the completed event"
+        );
+        let turn_errors = observer
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "turn_error")
+            .count();
+        assert_eq!(
+            turn_errors, 1,
+            "reply-delivery failure must emit exactly one visible turn_error"
+        );
+        assert!(
+            pool.agents_mut()[0].is_some(),
+            "the ACP process completed and must be returned to the pool, not respawned"
         );
     }
 
