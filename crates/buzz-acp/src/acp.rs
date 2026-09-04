@@ -214,6 +214,9 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Assistant text emitted during the current ACP prompt. Retained until
+    /// the caller consumes it for deterministic relay delivery.
+    last_agent_message: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -563,6 +566,7 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            last_agent_message: String::new(),
         })
     }
 
@@ -585,6 +589,11 @@ impl AcpClient {
     /// Return the pool slot index for this agent process.
     pub(crate) fn observer_agent_index(&self) -> Option<usize> {
         self.observer_agent_index
+    }
+
+    /// Consume assistant text emitted by the most recently completed prompt.
+    pub(crate) fn take_last_agent_message(&mut self) -> String {
+        std::mem::take(&mut self.last_agent_message)
     }
 
     /// Emit a semantic event to the local observer feed, if enabled.
@@ -781,6 +790,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.last_agent_message.clear();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1755,6 +1765,7 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    self.last_agent_message.push_str(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false

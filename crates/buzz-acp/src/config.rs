@@ -96,6 +96,7 @@ pub enum RespondTo {
     #[default]
     OwnerOnly,
     Allowlist,
+    #[value(alias = "members")]
     Anyone,
     Nobody,
 }
@@ -387,6 +388,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
 
+    /// Require a cryptographically verified reply to the exact triggering
+    /// Buzz event before a successful channel turn is acknowledged.
+    #[arg(long, env = "BUZZ_ACP_REQUIRE_REPLY", default_value_t = false)]
+    pub require_reply: bool,
+
     /// Enable NIP-AE agent core memory injection.
     ///
     /// Memory injection is on by default. When enabled, the harness
@@ -547,6 +553,8 @@ pub struct Config {
     pub max_turns_per_session: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
+    /// Require verified relay delivery for successful channel turns.
+    pub require_reply: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the harness skips the per-session core engram fetch and renders no
     /// `[Agent Memory — core]` section. On by default; disabled via the
@@ -1050,16 +1058,21 @@ impl Config {
 
         // Validate respond_to against the allowed set.
         let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
-            // Validate each entry is a known RespondTo mode.
-            for s in &raw {
-                RespondTo::from_str(s.trim(), true).map_err(|_| {
-                    ConfigError::ConfigFile(format!(
-                        "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                         (valid values: owner-only, allowlist, anyone, nobody)"
-                    ))
-                })?;
-            }
-            let allowed_modes: Vec<String> = raw.iter().map(|s| s.trim().to_string()).collect();
+            // Parse and canonicalize aliases before comparing them. This keeps
+            // a legacy `members` policy aligned with RespondTo::Anyone.
+            let allowed_modes: Vec<String> = raw
+                .iter()
+                .map(|s| {
+                    RespondTo::from_str(s.trim(), true)
+                        .map(|mode| mode.to_string())
+                        .map_err(|_| {
+                            ConfigError::ConfigFile(format!(
+                                "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
+                                 (valid values: owner-only, allowlist, anyone, nobody)"
+                            ))
+                        })
+                })
+                .collect::<Result<_, _>>()?;
             if !allowed_modes.is_empty() && !allowed_modes.contains(&args.respond_to.to_string()) {
                 return Err(ConfigError::ConfigFile(format!(
                     "respond_to '{}' is not permitted on this deployment \
@@ -1123,6 +1136,7 @@ impl Config {
             max_turns_per_session: args.max_turns_per_session,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
+            require_reply: args.require_reply,
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
@@ -1164,7 +1178,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1182,6 +1196,7 @@ impl Config {
             self.max_turns_per_session,
             self.presence_enabled,
             self.typing_enabled,
+            self.require_reply,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
@@ -1499,6 +1514,7 @@ mod tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            require_reply: false,
             memory_enabled: true,
             model: None,
             effort_level: None,
@@ -2234,6 +2250,17 @@ channels = "ALL"
     }
 
     #[test]
+    fn require_reply_defaults_off_and_is_opt_in() {
+        let key = "0".repeat(64);
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert!(!default.require_reply);
+
+        let configured =
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key, "--require-reply"]);
+        assert!(configured.require_reply);
+    }
+
+    #[test]
     fn idle_pool_sleep_defaults_disabled_and_accepts_cli_value() {
         let key = "0".repeat(64);
         let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
@@ -2858,6 +2885,21 @@ channels = "ALL"
             result.is_ok(),
             "from_args should accept respond_to=owner-only when in allowed set: {result:?}"
         );
+    }
+
+    #[test]
+    fn members_alias_is_allowed_by_members_policy() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "members",
+            "--allowed-respond-to",
+            "members",
+        ])
+        .expect("members alias should parse");
+        assert!(Config::from_args(args).is_ok());
     }
 
     #[test]
