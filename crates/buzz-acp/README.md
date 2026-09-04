@@ -113,11 +113,22 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_REQUIRE_REPLY` | no | `false` | Require a signed kind-9 reply from this identity linked to the exact triggering event before acknowledging a successful channel turn. Also available as `--require-reply`. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
 
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
+
+When require-reply mode is enabled, assistant text and ACP success are not
+delivery evidence. The harness queries the relay for a valid kind-9 event
+signed by its configured Buzz key with a canonical `reply` marker naming the
+exact triggering event. If none appears, it gives the same ACP session one
+delivery-only recovery turn that forbids repeating the completed work and asks
+it to invoke its credential-preserving `buzz_reply` MCP tool. Recovery is
+bounded to one attempt. Persistent failure produces a signed, linked warning
+and a non-success turn outcome; the original operational request is not run
+again. Heartbeats are unaffected.
 
 ### Parallel Agents & Heartbeat
 

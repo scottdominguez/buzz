@@ -514,6 +514,15 @@ pub enum TimeoutKind {
 pub enum PromptOutcome {
     Ok(StopReason),
     Error(AcpError),
+    /// ACP completed, but no signed kind-9 reply from the configured Buzz
+    /// identity linked to the exact triggering event was observable after one
+    /// constrained same-session delivery recovery attempt.
+    ReplyDeliveryFailed {
+        trigger_event_id: String,
+        recovery_attempts: usize,
+        notice_published: bool,
+        reason: String,
+    },
     AgentExited,
     Timeout(TimeoutKind),
     /// Intentional cancel via `!cancel` command or interrupt mode.
@@ -598,6 +607,8 @@ pub struct PromptContext {
     /// from `heartbeat_prompt` (agent self-prompting).
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
+    /// Require proof of a signed, exact-event reply before channel success.
+    pub require_reply: bool,
     pub system_prompt: Option<String>,
     /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
     /// on `session/new`. Never part of the prompt.
@@ -1729,6 +1740,255 @@ fn send_prompt_result(
     });
 }
 
+/// One additional ACP turn is allowed, and it is delivery-only. Keeping the
+/// bound compile-time and tiny prevents a broken adapter from turning recovery
+/// into an unbounded model/tool loop.
+const MAX_REPLY_RECOVERY_ATTEMPTS: usize = 1;
+const REPLY_PROOF_POLL_ATTEMPTS: usize = 3;
+const REPLY_PROOF_POLL_DELAY: Duration = Duration::from_millis(200);
+const REPLY_PROOF_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const REPLY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug)]
+struct ReplyDeliveryFailure {
+    trigger_event_id: String,
+    recovery_attempts: usize,
+    notice_published: bool,
+    reason: String,
+}
+
+/// Cryptographic delivery predicate for a channel turn.
+///
+/// The relay query is only a candidate selector. Every returned event still
+/// has to verify locally, be kind 9, be authored by the configured identity,
+/// target the channel, and carry the canonical NIP-10 reply marker for this
+/// exact triggering event. A root-only tag is intentionally insufficient.
+fn reply_proves_trigger(
+    event: &nostr::Event,
+    expected_author: nostr::PublicKey,
+    channel_id: Uuid,
+    trigger_event_id: &str,
+) -> bool {
+    if event.verify().is_err()
+        || event.pubkey != expected_author
+        || event.kind.as_u16() as u32 != buzz_core::kind::KIND_STREAM_MESSAGE
+    {
+        return false;
+    }
+
+    let expected_channel = channel_id.to_string();
+    let has_channel = event.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        values.len() == 2 && values[0] == "h" && values[1] == expected_channel
+    });
+    let has_exact_reply = event.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        values.len() == 4
+            && values[0] == "e"
+            && values[1] == trigger_event_id
+            && values[2].is_empty()
+            && values[3] == "reply"
+    });
+    has_channel && has_exact_reply
+}
+
+async fn verified_reply_exists(
+    rest: &RestClient,
+    channel_id: Uuid,
+    trigger_event_id: &str,
+) -> Result<bool, String> {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let expected_author = rest.keys.public_key();
+    let channel = channel_id.to_string();
+    let filter = nostr::Filter::new()
+        .author(expected_author)
+        .kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_STREAM_MESSAGE as u16,
+        ))
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::H), channel.as_str())
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::E), trigger_event_id)
+        .limit(50);
+
+    for attempt in 0..REPLY_PROOF_POLL_ATTEMPTS {
+        let response = tokio::time::timeout(
+            REPLY_PROOF_QUERY_TIMEOUT,
+            rest.query(std::slice::from_ref(&filter)),
+        )
+        .await
+        .map_err(|_| "reply proof query timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        let candidates = response
+            .as_array()
+            .ok_or_else(|| "reply proof query returned a non-array response".to_string())?;
+        if candidates.iter().any(|candidate| {
+            serde_json::from_value::<nostr::Event>(candidate.clone())
+                .ok()
+                .is_some_and(|event| {
+                    reply_proves_trigger(&event, expected_author, channel_id, trigger_event_id)
+                })
+        }) {
+            return Ok(true);
+        }
+        if attempt + 1 < REPLY_PROOF_POLL_ATTEMPTS {
+            tokio::time::sleep(REPLY_PROOF_POLL_DELAY).await;
+        }
+    }
+    Ok(false)
+}
+
+fn reply_recovery_prompt(channel_id: Uuid, trigger_event_id: &str, attempt: usize) -> String {
+    format!(
+        "DELIVERY RECOVERY ONLY (attempt {attempt} of {MAX_REPLY_RECOVERY_ATTEMPTS}).\n\
+         The preceding task is already complete. Do not repeat the operational work, rerun tools, \
+         or start a new analysis. No verified Buzz reply was observed for the triggering event.\n\
+         Use only the credential-preserving `buzz_reply` MCP tool available in this session to \
+         publish the concise result you already produced. Target channel {channel_id} and set its \
+         reply-to event ID to exactly {trigger_event_id}. Do not emit assistant text instead of \
+         invoking the tool."
+    )
+}
+
+/// Enforce relay delivery while the original ACP session still contains the
+/// completed work. The triggering batch remains owned by the task throughout,
+/// so the queue cannot acknowledge it between the original turn and recovery.
+async fn require_verified_reply(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    session_id: &str,
+    batch: &FlushBatch,
+) -> Result<(), ReplyDeliveryFailure> {
+    let Some(trigger) = batch.events.last() else {
+        return Err(ReplyDeliveryFailure {
+            trigger_event_id: "<missing>".to_string(),
+            recovery_attempts: 0,
+            notice_published: false,
+            reason: "channel batch contained no triggering event".to_string(),
+        });
+    };
+    let trigger_event_id = trigger.event.id.to_hex();
+    let completed_reply = agent.acp.take_last_agent_message();
+
+    match verified_reply_exists(&ctx.rest_client, batch.channel_id, &trigger_event_id).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => tracing::warn!(
+            channel_id = %batch.channel_id,
+            event_id = %trigger_event_id,
+            "ACP returned success without a verified Buzz reply; starting constrained recovery"
+        ),
+        Err(error) => tracing::warn!(
+            channel_id = %batch.channel_id,
+            event_id = %trigger_event_id,
+            %error,
+            "reply proof query failed; success remains unproven and constrained recovery will run"
+        ),
+    }
+
+    // ACP assistant text is the completed result. If the model did not select
+    // the reply MCP, publish that exact result once with the harness identity,
+    // then require the same cryptographic proof. The query above prevents a
+    // duplicate when the tool's send returned ambiguously but actually landed.
+    if let Some(content) = (!completed_reply.trim().is_empty()).then(|| completed_reply.trim()) {
+        if post_failure_notice_for_event(
+            &ctx.rest_client,
+            batch.channel_id,
+            &trigger.event,
+            content,
+        )
+        .await
+        {
+            match verified_reply_exists(&ctx.rest_client, batch.channel_id, &trigger_event_id).await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        channel_id = %batch.channel_id,
+                        event_id = %trigger_event_id,
+                        "published and verified deterministic ACP text reply"
+                    );
+                    return Ok(());
+                }
+                Ok(false) => tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    event_id = %trigger_event_id,
+                    "deterministic ACP text reply was submitted but not verified"
+                ),
+                Err(error) => tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    event_id = %trigger_event_id,
+                    %error,
+                    "deterministic ACP text reply proof query failed"
+                ),
+            }
+        }
+    }
+
+    let mut last_reason = "no matching signed kind-9 reply was found".to_string();
+    let mut recovery_attempts = 0;
+    for attempt in 1..=MAX_REPLY_RECOVERY_ATTEMPTS {
+        recovery_attempts = attempt;
+        let recovery_prompt = reply_recovery_prompt(batch.channel_id, &trigger_event_id, attempt);
+        let idle_timeout = ctx.idle_timeout.min(REPLY_RECOVERY_TIMEOUT);
+        let max_duration = ctx.max_turn_duration.min(REPLY_RECOVERY_TIMEOUT);
+        match agent
+            .acp
+            .session_prompt_with_idle_timeout(
+                session_id,
+                &recovery_prompt,
+                idle_timeout,
+                max_duration,
+            )
+            .await
+        {
+            Ok(stop_reason) => {
+                tracing::info!(
+                    channel_id = %batch.channel_id,
+                    event_id = %trigger_event_id,
+                    attempt,
+                    ?stop_reason,
+                    "delivery-only recovery turn completed"
+                );
+                match verified_reply_exists(&ctx.rest_client, batch.channel_id, &trigger_event_id)
+                    .await
+                {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {
+                        last_reason =
+                            "recovery completed without a matching signed kind-9 reply".to_string()
+                    }
+                    Err(error) => last_reason = format!("reply verification failed: {error}"),
+                }
+            }
+            Err(error) => last_reason = format!("delivery-only ACP recovery failed: {error}"),
+        }
+    }
+
+    let content = format!(
+        "⚠️ Reply delivery failed after {recovery_attempts} constrained recovery attempt. \
+         The agent completed the work, but no verified reply linked to event \
+         {trigger_event_id} appeared. The operational work was not repeated. \
+         Check the agent's buzz_reply MCP configuration."
+    );
+    let notice_published =
+        post_failure_notice_for_event(&ctx.rest_client, batch.channel_id, &trigger.event, &content)
+            .await;
+
+    Err(ReplyDeliveryFailure {
+        trigger_event_id,
+        recovery_attempts,
+        notice_published,
+        reason: last_reason,
+    })
+}
+
+fn reply_delivery_failure_outcome(failure: ReplyDeliveryFailure) -> PromptOutcome {
+    PromptOutcome::ReplyDeliveryFailed {
+        trigger_event_id: failure.trigger_event_id,
+        recovery_attempts: failure.recovery_attempts,
+        notice_published: failure.notice_published,
+        reason: failure.reason,
+    }
+}
+
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -2595,6 +2855,38 @@ pub async fn run_prompt_task(
                             );
                         }
                         log_stop_reason(&source, &StopReason::EndTurn);
+                        if ctx.require_reply {
+                            if let Some(channel_batch) = batch.as_ref() {
+                                if let Err(failure) = require_verified_reply(
+                                    &mut agent,
+                                    &ctx,
+                                    &session_id,
+                                    channel_batch,
+                                )
+                                .await
+                                {
+                                    let usage = agent.acp.take_turn_usage();
+                                    publish_agent_turn_metric(
+                                        &ctx,
+                                        usage,
+                                        observer_channel_id,
+                                        &session_id,
+                                        &turn_id,
+                                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                                    )
+                                    .await;
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        reply_delivery_failure_outcome(failure),
+                                        batch,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         if let PromptSource::Channel(cid) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             record_channel_delivery_success(
@@ -2637,6 +2929,34 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            if ctx.require_reply {
+                if let Some(channel_batch) = batch.as_ref() {
+                    if let Err(failure) =
+                        require_verified_reply(&mut agent, &ctx, &session_id, channel_batch).await
+                    {
+                        let usage = agent.acp.take_turn_usage();
+                        publish_agent_turn_metric(
+                            &ctx,
+                            usage,
+                            observer_channel_id,
+                            &session_id,
+                            &turn_id,
+                            Some(buzz_core::agent_turn_metric::StopReason::Error),
+                        )
+                        .await;
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            reply_delivery_failure_outcome(failure),
+                            batch,
+                        );
+                        return;
+                    }
+                }
+            }
 
             if let PromptSource::Channel(cid) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -4540,6 +4860,63 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
+/// Build a signed kind-9 direct reply to the exact triggering event.
+fn build_failure_notice_for_event(
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    trigger_event: &nostr::Event,
+    content: &str,
+) -> Result<nostr::Event, String> {
+    let trigger = trigger_event.id;
+    let root = crate::queue::parse_thread_tags(trigger_event)
+        .root_event_id
+        .as_deref()
+        .map(nostr::EventId::from_hex)
+        .transpose()
+        .map_err(|error| format!("invalid root event id: {error}"))?
+        .unwrap_or(trigger);
+    let thread_ref = buzz_sdk::ThreadRef {
+        root_event_id: root,
+        parent_event_id: trigger,
+    };
+    let builder = buzz_sdk::build_message(channel_id, content, Some(&thread_ref), &[], false, &[])
+        .map_err(|error| format!("build failed: {error}"))?;
+    builder
+        .sign_with_keys(keys)
+        .map_err(|error| format!("sign failed: {error}"))
+}
+
+/// Post a signed kind-9 direct reply to the exact triggering event.
+///
+/// The boolean result lets reply enforcement report whether its terminal
+/// failure became user-visible without exposing credentials or response data.
+pub(crate) async fn post_failure_notice_for_event(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    trigger_event: &nostr::Event,
+    content: &str,
+) -> bool {
+    let event = match build_failure_notice_for_event(&rest.keys, channel_id, trigger_event, content)
+    {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::error!(channel = %channel_id, %error, "terminal reply failure notice could not be constructed");
+            return false;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            tracing::error!(channel = %channel_id, %error, "terminal reply failure notice: publish failed");
+            false
+        }
+        Err(_) => {
+            tracing::error!(channel = %channel_id, "terminal reply failure notice: publish timed out");
+            false
+        }
+    }
+}
+
 /// Best-effort: post a visible failure notice (kind:9) to a channel after a
 /// batch is dead-lettered. Replies into the thread of `thread_tags` when the
 /// triggering event was threaded. Errors are logged and swallowed — the
@@ -4712,6 +5089,169 @@ mod tests {
             args: vec![],
             env: vec![],
         }
+    }
+
+    fn signed_reply(keys: &Keys, channel_id: Uuid, trigger_event_id: &str) -> nostr::Event {
+        let trigger = nostr::EventId::from_hex(trigger_event_id).unwrap();
+        buzz_sdk::build_message(
+            channel_id,
+            "delivered",
+            Some(&buzz_sdk::ThreadRef {
+                root_event_id: trigger,
+                parent_event_id: trigger,
+            }),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .sign_with_keys(keys)
+        .unwrap()
+    }
+
+    #[test]
+    fn signed_kind_9_exact_reply_proves_trigger() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger = "a".repeat(64);
+        let event = signed_reply(&keys, channel_id, &trigger);
+        assert!(reply_proves_trigger(
+            &event,
+            keys.public_key(),
+            channel_id,
+            &trigger
+        ));
+    }
+
+    #[test]
+    fn reply_with_root_only_does_not_prove_exact_trigger() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger = "b".repeat(64);
+        let event = EventBuilder::new(Kind::Custom(9), "not a direct reply")
+            .tags([
+                Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["e", &trigger, "", "root"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(!reply_proves_trigger(
+            &event,
+            keys.public_key(),
+            channel_id,
+            &trigger
+        ));
+    }
+
+    #[test]
+    fn wrong_author_does_not_prove_reply() {
+        let configured = Keys::generate();
+        let other = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger = "c".repeat(64);
+        let event = signed_reply(&other, channel_id, &trigger);
+        assert!(!reply_proves_trigger(
+            &event,
+            configured.public_key(),
+            channel_id,
+            &trigger
+        ));
+    }
+
+    #[test]
+    fn tampered_signature_does_not_prove_reply() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger = "d".repeat(64);
+        let event = signed_reply(&keys, channel_id, &trigger);
+        let mut json = serde_json::to_value(event).unwrap();
+        json["content"] = serde_json::Value::String("tampered".to_string());
+        let tampered: nostr::Event = serde_json::from_value(json).unwrap();
+        assert!(!reply_proves_trigger(
+            &tampered,
+            keys.public_key(),
+            channel_id,
+            &trigger
+        ));
+    }
+
+    #[test]
+    fn same_session_recovery_is_bounded() {
+        assert_eq!(MAX_REPLY_RECOVERY_ATTEMPTS, 1);
+        let prompt = reply_recovery_prompt(Uuid::nil(), &"e".repeat(64), 1);
+        assert!(prompt.contains("Do not repeat the operational work"));
+        assert!(prompt.contains("`buzz_reply` MCP tool"));
+        assert!(prompt.contains(&"e".repeat(64)));
+    }
+
+    #[test]
+    fn missing_reply_is_not_successfully_acknowledged() {
+        let outcome = PromptOutcome::ReplyDeliveryFailed {
+            trigger_event_id: "f".repeat(64),
+            recovery_attempts: MAX_REPLY_RECOVERY_ATTEMPTS,
+            notice_published: true,
+            reason: "proof absent".to_string(),
+        };
+        assert!(!matches!(outcome, PromptOutcome::Ok(_)));
+    }
+
+    #[test]
+    fn terminal_reply_failure_posts_visible_linked_notice() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger_event = EventBuilder::new(Kind::Custom(9), "trigger")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let trigger = trigger_event.id.to_hex();
+        let event = build_failure_notice_for_event(
+            &keys,
+            channel_id,
+            &trigger_event,
+            "Reply delivery failed after 1 constrained recovery attempt.",
+        )
+        .unwrap();
+        assert!(event.content.contains("Reply delivery failed after"));
+        assert!(reply_proves_trigger(
+            &event,
+            keys.public_key(),
+            channel_id,
+            &trigger
+        ));
+    }
+
+    #[test]
+    fn terminal_reply_failure_preserves_existing_thread_root() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let root = "2".repeat(64);
+        let trigger_event = EventBuilder::new(Kind::Custom(9), "nested trigger")
+            .tags([
+                Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["e", &root, "", "root"]).unwrap(),
+                Tag::parse(["e", &"3".repeat(64), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event = build_failure_notice_for_event(
+            &keys,
+            channel_id,
+            &trigger_event,
+            "Reply delivery failed after 1 constrained recovery attempt.",
+        )
+        .unwrap();
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        assert!(tags.contains(&vec!["e".into(), root, "".into(), "root".into()]));
+        assert!(tags.contains(&vec![
+            "e".into(),
+            trigger_event.id.to_hex(),
+            "".into(),
+            "reply".into()
+        ]));
     }
 
     #[test]
@@ -6166,6 +6706,231 @@ done"#
     }
 
     #[tokio::test]
+    async fn failed_reply_send_readback_and_single_recovery_end_in_visible_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel_id = Uuid::new_v4();
+        let agent_keys = Keys::generate();
+        let trigger_event = EventBuilder::new(Kind::Custom(9), "operational-work-sentinel")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let trigger_event_id = trigger_event.id.to_hex();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![crate::queue::BatchEvent {
+                event: trigger_event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        // The relay returns no proof for either readback sequence. It accepts
+        // the final signed kind-9 warning so terminal failure is user-visible.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reply-proof server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let proof_queries = Arc::new(AtomicUsize::new(0));
+        let server_proof_queries = Arc::clone(&proof_queries);
+        let notices = Arc::new(Mutex::new(Vec::<nostr::Event>::new()));
+        let server_notices = Arc::clone(&notices);
+        let expected_trigger = trigger_event_id.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 64 * 1024];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]);
+                let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("");
+
+                let response_body = if path == "/query" {
+                    if let Ok(filters) = serde_json::from_str::<serde_json::Value>(body) {
+                        let is_proof = filters
+                            .as_array()
+                            .and_then(|values| values.first())
+                            .is_some_and(|filter| {
+                                filter["kinds"] == json!([9])
+                                    && filter["#e"] == json!([expected_trigger])
+                            });
+                        if is_proof {
+                            server_proof_queries.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    "[]"
+                } else if path == "/events" {
+                    if let Ok(event) = serde_json::from_str::<nostr::Event>(body) {
+                        if event.kind.as_u16() as u32 == buzz_core::kind::KIND_STREAM_MESSAGE {
+                            server_notices.lock().unwrap().push(event);
+                        }
+                    }
+                    "{}"
+                } else {
+                    "[]"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        // Both ACP turns report a failed/timeout-like buzz_reply tool call.
+        // There are exactly two session/prompt requests: original work and the
+        // one delivery-only recovery. No assistant text is emitted, so the
+        // deterministic text fallback cannot mask the failed tool delivery.
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-require-reply-wire-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"tool_call","toolCallId":"reply","title":"buzz_reply","kind":"execute"}}}}}}'
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"tool_call_update","toolCallId":"reply","status":"failed","rawOutput":"exit status 124: timed out"}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn require-reply ACP");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(channel_id, "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(channel_id, ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.require_reply = true;
+        ctx.rest_client = RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.clone(),
+            keys: agent_keys.clone(),
+            auth_tag_json: None,
+        };
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "reply-test".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::new(ctx),
+            result_tx,
+            None,
+            "require-reply-turn".into(),
+        )
+        .await;
+        let mut result = result_rx.recv().await.expect("prompt result");
+
+        match &result.outcome {
+            PromptOutcome::ReplyDeliveryFailed {
+                trigger_event_id: failed_trigger,
+                recovery_attempts,
+                notice_published,
+                ..
+            } => {
+                assert_eq!(failed_trigger, &trigger_event_id);
+                assert_eq!(*recovery_attempts, 1);
+                assert!(*notice_published);
+            }
+            _ => panic!("missing proof must mark the turn failed"),
+        }
+        assert!(
+            result.batch.is_some(),
+            "failed turn retains batch ownership"
+        );
+        assert!(
+            !result.agent.state.deliveries[&channel_id]
+                .delivered_event_ids
+                .contains(&trigger_event_id),
+            "failed proof must not commit ACP delivery state"
+        );
+        result.agent.acp.shutdown().await;
+        server.abort();
+
+        assert_eq!(
+            proof_queries.load(Ordering::SeqCst),
+            REPLY_PROOF_POLL_ATTEMPTS * 2,
+            "one immediate readback sequence and one post-recovery sequence"
+        );
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 1, "one terminal kind-9 notice is visible");
+        assert!(notices[0].content.contains("Reply delivery failed"));
+        assert!(reply_proves_trigger(
+            &notices[0],
+            agent_keys.public_key(),
+            channel_id,
+            &trigger_event_id
+        ));
+        drop(notices);
+
+        let prompts: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read captured ACP prompts")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured prompt JSON"))
+            .collect();
+        std::fs::remove_file(&capture).expect("remove ACP capture");
+        assert_eq!(prompts.len(), 2, "recovery must be bounded to one turn");
+        let prompt_text = |index: usize| {
+            prompts[index]["params"]["prompt"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(prompt_text(0).contains("operational-work-sentinel"));
+        assert!(prompt_text(1).contains("DELIVERY RECOVERY ONLY"));
+        assert!(prompt_text(1).contains("Do not repeat the operational work"));
+        assert!(!prompt_text(1).contains("operational-work-sentinel"));
+    }
+
+    #[tokio::test]
     async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -6913,6 +7678,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "Timeout(Hard)",
             PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
             PromptOutcome::Error(_) => "Error",
+            PromptOutcome::ReplyDeliveryFailed { .. } => "ReplyDeliveryFailed",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::Ok(_) => "Ok",
         };
@@ -7924,6 +8690,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
+            require_reply: false,
             system_prompt: None,
             session_title: None,
             team_instructions: None,
