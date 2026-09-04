@@ -217,6 +217,41 @@ buzz-acp --agents 2 --heartbeat-interval 300 \
   --heartbeat-prompt "Check get_feed_actions() for pending approvals, then get_feed_mentions() for unanswered mentions. If nothing actionable, end your turn immediately."
 ```
 
+### Multiple-event handling & true steering
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--multiple-event-handling` | `BUZZ_ACP_MULTIPLE_EVENT_HANDLING` | `steer` | What happens when a new eligible @mention arrives while a turn is already in-flight: `steer`, `queue`, `interrupt`, `owner-interrupt`. |
+| `--dedup` | `BUZZ_ACP_DEDUP` | `queue` | Must be `queue` for `steer`/`interrupt`/`owner-interrupt`. `drop` discards mid-turn events. |
+
+**`steer` (default) — capability-aware true steering.** When the agent advertises
+`_meta.steering.supported: true` in its ACP `initialize` response, a second
+eligible event is **injected into the live turn without cancelling it**:
+
+- The steer is delivered over `_session/steering` (cross-adapter extension used
+  by claude-agent-acp and codex-acp) or `_goose/unstable/session/steer` (goose).
+- The original `session/prompt` stays alive and the agent weaves the new text
+  into its in-progress work.
+- **Zero `session/cancel` calls** on this path.
+
+When the agent does **not** advertise the capability — e.g. the `hermes-agent`
+adapter — the second event enters the
+**ordered queue** and is delivered after the current turn completes. It is
+**never** a cancel-and-re-prompt: cancellation is reserved for explicit owner
+stop/supersede policy (`interrupt`, `!cancel`, `!rotate`).
+
+`_meta.steering.supported` is the **sole** capability signal. A Goose run id
+only selects the Goose transport after that capability is true; receiving one
+does not enable steering. The harness never infers support from the model name,
+adapter command, or any `session/update` notification. See the
+[test](tests/steering_no_cancel.rs) for the deterministic proof: a capable
+fake agent receives a true non-cancelling steer into the same session, and a
+no-capability agent falls back to the ordered queue with zero `session/cancel`.
+
+**`interrupt` / `owner-interrupt`** remain explicit supersede policy: the
+in-flight turn is cancelled and re-prompted with the new request framed as a
+replacement. `queue` delivers after the current turn, always.
+
 ### Shared Identity
 
 All N agents authenticate as the **same Nostr bot identity** — users see one bot regardless of how many agents are running. The same channel is never processed by two agents simultaneously (the queue enforces this). Cross-channel message ordering is not guaranteed when N>1.
