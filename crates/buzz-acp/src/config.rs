@@ -89,6 +89,9 @@ pub enum MultipleEventHandling {
 ///
 /// - `owner-only` — only the agent's registered owner (default).
 /// - `allowlist`  — owner + explicit pubkey list (`--respond-to-allowlist`).
+/// - `members`    — owner/same-owner siblings + current members of the event's
+///   channel (resolved via the relay REST API). Fail-closed: events are
+///   dropped when membership cannot be resolved.
 /// - `anyone`     — all events forwarded (no author filtering).
 /// - `nobody`     — all events dropped (proactive/heartbeat-only mode).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
@@ -96,7 +99,7 @@ pub enum RespondTo {
     #[default]
     OwnerOnly,
     Allowlist,
-    #[value(alias = "members")]
+    Members,
     Anyone,
     Nobody,
 }
@@ -106,6 +109,7 @@ impl std::fmt::Display for RespondTo {
         match self {
             Self::OwnerOnly => f.write_str("owner-only"),
             Self::Allowlist => f.write_str("allowlist"),
+            Self::Members => f.write_str("members"),
             Self::Anyone => f.write_str("anyone"),
             Self::Nobody => f.write_str("nobody"),
         }
@@ -464,7 +468,7 @@ pub struct CliArgs {
     pub permission_mode: PermissionMode,
 
     /// Inbound author gate: which authors' events the harness forwards.
-    /// Modes: owner-only (default), allowlist, anyone, nobody.
+    /// Modes: owner-only (default), allowlist, members, anyone, nobody.
     #[arg(
         long,
         env = "BUZZ_ACP_RESPOND_TO",
@@ -480,7 +484,7 @@ pub struct CliArgs {
 
     /// Comma-separated list of allowed `--respond-to` modes.
     /// When set, the harness rejects startup if `--respond-to` is not in this list.
-    /// Modes: owner-only, allowlist, anyone, nobody.
+    /// Modes: owner-only, allowlist, members, anyone, nobody.
     /// Default: empty (all modes allowed — no restriction).
     /// Example: `BUZZ_ACP_ALLOWED_RESPOND_TO=owner-only,allowlist`
     #[arg(long, env = "BUZZ_ACP_ALLOWED_RESPOND_TO", value_delimiter = ',')]
@@ -1058,8 +1062,8 @@ impl Config {
 
         // Validate respond_to against the allowed set.
         let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
-            // Parse and canonicalize aliases before comparing them. This keeps
-            // a legacy `members` policy aligned with RespondTo::Anyone.
+            // Parse and canonicalize each allowed mode to its Display form
+            // before comparing against the configured respond_to.
             let allowed_modes: Vec<String> = raw
                 .iter()
                 .map(|s| {
@@ -1068,7 +1072,7 @@ impl Config {
                         .map_err(|_| {
                             ConfigError::ConfigFile(format!(
                                 "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                                 (valid values: owner-only, allowlist, anyone, nobody)"
+                                 (valid values: owner-only, allowlist, members, anyone, nobody)"
                             ))
                         })
                 })
@@ -2526,6 +2530,7 @@ channels = "ALL"
     fn test_respond_to_display() {
         assert_eq!(format!("{}", RespondTo::OwnerOnly), "owner-only");
         assert_eq!(format!("{}", RespondTo::Allowlist), "allowlist");
+        assert_eq!(format!("{}", RespondTo::Members), "members");
         assert_eq!(format!("{}", RespondTo::Anyone), "anyone");
         assert_eq!(format!("{}", RespondTo::Nobody), "nobody");
     }
@@ -2540,6 +2545,10 @@ channels = "ALL"
         assert_eq!(
             RespondTo::from_str("allowlist", true).unwrap(),
             RespondTo::Allowlist
+        );
+        assert_eq!(
+            RespondTo::from_str("members", true).unwrap(),
+            RespondTo::Members
         );
         assert_eq!(
             RespondTo::from_str("anyone", true).unwrap(),
@@ -2558,6 +2567,17 @@ channels = "ALL"
         assert!(
             s.contains("respond_to=anyone"),
             "test_config uses Anyone, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_summary_respond_to_members() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.respond_to = RespondTo::Members;
+        let s = config.summary();
+        assert!(
+            s.contains("respond_to=members"),
+            "summary should report respond_to=members, got: {s}"
         );
     }
 
@@ -2888,7 +2908,7 @@ channels = "ALL"
     }
 
     #[test]
-    fn members_alias_is_allowed_by_members_policy() {
+    fn members_mode_is_allowed_by_members_policy() {
         let args = CliArgs::try_parse_from([
             "buzz-acp",
             "--private-key",
@@ -2898,8 +2918,55 @@ channels = "ALL"
             "--allowed-respond-to",
             "members",
         ])
-        .expect("members alias should parse");
-        assert!(Config::from_args(args).is_ok());
+        .expect("members mode should parse");
+        let config = Config::from_args(args).expect("from_args should accept members mode");
+        assert_eq!(
+            config.respond_to,
+            RespondTo::Members,
+            "`--respond-to members` must select the strict Members mode, not Anyone"
+        );
+    }
+
+    #[test]
+    fn members_mode_is_rejected_when_not_allowed() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "members",
+            "--allowed-respond-to",
+            "owner-only,allowlist",
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+        assert!(
+            result.is_err(),
+            "from_args should reject respond_to=members when not in allowed set"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not permitted"),
+            "error should mention 'not permitted': {msg}"
+        );
+    }
+
+    #[test]
+    fn members_mode_selects_members_not_anyone() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "members",
+        ])
+        .expect("members mode should parse");
+        let config = Config::from_args(args).expect("from_args should accept members mode");
+        assert_eq!(
+            config.respond_to,
+            RespondTo::Members,
+            "`--respond-to members` must map to the strict Members mode"
+        );
     }
 
     #[test]

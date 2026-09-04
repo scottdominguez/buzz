@@ -233,21 +233,32 @@ async fn is_owner_or_sibling(
 
 /// Inbound author gate decision: does this author's event fire a turn?
 ///
-/// Coarse security policy applied before subscription rules. Both `OwnerOnly`
-/// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
-/// additionally accepts the explicit external pubkey list.
+/// Coarse security policy applied before subscription rules. `OwnerOnly`,
+/// `Allowlist`, and `Members` all accept the owner and same-owner siblings;
+/// `Allowlist` additionally accepts the explicit external pubkey list;
+/// `Members` additionally accepts current members of the event's channel.
 ///
 /// # DM hardening (`is_dm`)
 ///
 /// Clients auto-p-tag every DM participant, so in a DM *any* participant's
 /// message looks like a mention and would fire a turn. Combined with
 /// agent-initiated DMs (the agent can be asked to DM a third party), that
-/// turns `anyone`/`allowlist` modes into transitive access grants: whoever
-/// lands in a DM with the agent can prompt it. To close that hole, when
-/// `is_dm` is true only the owner and cryptographically verified same-owner
-/// siblings may fire a turn — the explicit allowlist and `anyone` mode do
-/// NOT apply inside DMs. `Nobody` still drops everything. Callers must
-/// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
+/// turns `anyone`/`allowlist`/`members` modes into transitive access grants:
+/// whoever lands in a DM with the agent can prompt it. To close that hole,
+/// when `is_dm` is true only the owner and cryptographically verified
+/// same-owner siblings may fire a turn — the explicit allowlist, `members`,
+/// and `anyone` modes do NOT apply inside DMs. `Nobody` still drops
+/// everything. Callers must resolve `is_dm` fail-closed: unknown channel
+/// type ⇒ treat as DM.
+///
+/// # Fail-closed membership (`Members`)
+///
+/// In a non-DM channel under `Members`, an author that is neither owner nor
+/// sibling must resolve as a current channel member before the event is
+/// forwarded. If membership cannot be resolved (fetch error/timeout) the
+/// event is dropped with a warning and the failure is NOT cached, so a later
+/// event retries.
+#[allow(clippy::too_many_arguments)] // gate inputs; mirrors relay::handle_ws_message
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
@@ -255,6 +266,8 @@ async fn author_allowed(
     is_dm: bool,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
+    channel_id: Uuid,
+    member_resolver: &pool::MemberResolver,
 ) -> bool {
     if is_dm {
         return match respond_to {
@@ -269,6 +282,22 @@ async fn author_allowed(
         RespondTo::Allowlist => {
             allowlist.contains(author)
                 || is_owner_or_sibling(author, owner_cache, rest_client).await
+        }
+        RespondTo::Members => {
+            if is_owner_or_sibling(author, owner_cache, rest_client).await {
+                return true;
+            }
+            match member_resolver.is_member(channel_id, author).await {
+                Some(is_member) => is_member,
+                None => {
+                    tracing::warn!(
+                        channel_id = %channel_id,
+                        author,
+                        "respond_to=members: membership unresolved — dropping event (fail closed)"
+                    );
+                    false
+                }
+            }
         }
     }
 }
@@ -2212,6 +2241,7 @@ async fn tokio_main() -> Result<()> {
         cwd,
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
+        member_resolver: pool::MemberResolver::new(relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
@@ -2683,6 +2713,11 @@ async fn tokio_main() -> Result<()> {
                                 }
                                 membership_newest_ts.insert(ch, ts);
 
+                                // Member-resolver cache is TTL-bounded, but
+                                // invalidate now so a membership change is
+                                // effective immediately (not up to the TTL).
+                                ctx.member_resolver.invalidate(ch);
+
                                 if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
                                     // Clear removal tracking so sessions are not
                                     // stripped for a legitimately re-added channel.
@@ -2880,6 +2915,8 @@ async fn tokio_main() -> Result<()> {
                                     is_dm,
                                     &owner_cache,
                                     &ctx.rest_client,
+                                    buzz_event.channel_id,
+                                    &ctx.member_resolver,
                                 )
                                 .await;
                                 if !allowed {
@@ -2940,10 +2977,12 @@ async fn tokio_main() -> Result<()> {
                             // the channel has an in-flight task, fire cancel —
                             // OR take the non-cancelling (ACP steer) fork for Steer signals.
                             if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
-                                // Author eligibility (owner ∪ allowlist ∪ siblings)
-                                // is already enforced by the inbound author gate
-                                // above, so the mid-turn signal fires for every
-                                // event that reaches here.
+                                // Author eligibility (owner ∪ allowlist ∪
+                                // siblings, or channel members under
+                                // respond_to=members) is already enforced by
+                                // the inbound author gate above, so the
+                                // mid-turn signal fires for every event that
+                                // reaches here.
                                 let signal = mode_gate_signal(
                                     config.multiple_event_handling,
                                     &author_hex,
@@ -5390,6 +5429,13 @@ mod author_gate_tests {
         }
     }
 
+    /// A `MemberResolver` whose HTTP endpoint is never reached by the modes
+    /// exercised in the shared-gate tests (only `RespondTo::Members` in a
+    /// non-DM channel issues a membership fetch).
+    fn dummy_member_resolver() -> pool::MemberResolver {
+        pool::MemberResolver::new(dummy_rest_client())
+    }
+
     const OWNER: &str = "00";
     const SIBLING: &str = "11";
     const EXTERNAL: &str = "22";
@@ -5415,7 +5461,9 @@ mod author_gate_tests {
                 SIBLING,
                 false,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "a same-owner sibling must fire a turn under Allowlist even when not listed"
@@ -5433,7 +5481,9 @@ mod author_gate_tests {
                 EXTERNAL,
                 false,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "an explicitly allowlisted external pubkey must still be accepted"
@@ -5451,7 +5501,9 @@ mod author_gate_tests {
                 STRANGER,
                 false,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "a non-sibling absent from the allowlist must be dropped"
@@ -5469,7 +5521,9 @@ mod author_gate_tests {
                 OWNER,
                 false,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "the owner must always be accepted under Allowlist"
@@ -5490,7 +5544,9 @@ mod author_gate_tests {
                 STRANGER,
                 false,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "under the default OwnerOnly, a stranger must be dropped — so it can never reach the mode gate to steer"
@@ -5508,7 +5564,9 @@ mod author_gate_tests {
                     who,
                     false,
                     &cache,
-                    &dummy_rest_client()
+                    &dummy_rest_client(),
+                    Uuid::nil(),
+                    &dummy_member_resolver(),
                 )
                 .await,
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
@@ -5534,7 +5592,9 @@ mod author_gate_tests {
                 EXTERNAL,
                 true,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "an allowlisted external pubkey must NOT fire a turn inside a DM"
@@ -5551,7 +5611,9 @@ mod author_gate_tests {
                 STRANGER,
                 true,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "respond_to=anyone must still drop non-owner authors inside a DM"
@@ -5574,7 +5636,9 @@ mod author_gate_tests {
                         who,
                         true,
                         &cache,
-                        &dummy_rest_client()
+                        &dummy_rest_client(),
+                        Uuid::nil(),
+                        &dummy_member_resolver(),
                     )
                     .await,
                     "in a DM under {mode}, the {label} must still be admitted"
@@ -5593,10 +5657,294 @@ mod author_gate_tests {
                 OWNER,
                 true,
                 &cache,
-                &dummy_rest_client()
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "respond_to=nobody must drop everything, DMs included"
+        );
+    }
+
+    // ── respond_to=members channel-member gate ────────────────────────────
+
+    /// A `MemberResolver` backed by a local HTTP server that replays a script
+    /// of `(status, body)` responses (one per request). Requests beyond the
+    /// script length get a 200 empty JSON array. Returns the resolver, a
+    /// request counter, and the server task handle.
+    async fn member_resolver_with_script(
+        script: Vec<(u16, serde_json::Value)>,
+    ) -> (
+        pool::MemberResolver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let script = Arc::new(Mutex::new(script));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = {
+                    let mut script = script.lock().unwrap();
+                    if script.is_empty() {
+                        (200u16, "[]".to_string())
+                    } else {
+                        let (status, body) = script.remove(0);
+                        (status, body.to_string())
+                    }
+                };
+                let status_line = if status == 200 {
+                    "200 OK".to_string()
+                } else {
+                    format!("{status} Error")
+                };
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (pool::MemberResolver::new(rest), requests, server)
+    }
+
+    #[tokio::test]
+    async fn test_members_admits_current_channel_member() {
+        let channel_id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", channel_id.to_string()], ["p", EXTERNAL], ["p", STRANGER]]
+        }]);
+        let (member_resolver, _requests, server) =
+            member_resolver_with_script(vec![(200, response)]).await;
+        let cache = cache_with_sibling();
+        assert!(
+            author_allowed(
+                &RespondTo::Members,
+                &HashSet::new(),
+                EXTERNAL,
+                false,
+                &cache,
+                &dummy_rest_client(),
+                channel_id,
+                &member_resolver,
+            )
+            .await,
+            "a current channel member must fire a turn under Members"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_members_drops_non_member() {
+        let channel_id = Uuid::new_v4();
+        let response =
+            serde_json::json!([{ "tags": [["d", channel_id.to_string()], ["p", EXTERNAL]] }]);
+        let (member_resolver, _requests, server) =
+            member_resolver_with_script(vec![(200, response)]).await;
+        let cache = cache_with_sibling();
+        assert!(
+            !author_allowed(
+                &RespondTo::Members,
+                &HashSet::new(),
+                STRANGER,
+                false,
+                &cache,
+                &dummy_rest_client(),
+                channel_id,
+                &member_resolver,
+            )
+            .await,
+            "a non-member must be dropped under Members"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_members_always_admits_owner_and_sibling() {
+        let channel_id = Uuid::new_v4();
+        // Members list excludes OWNER and SIBLING — both must still pass via
+        // the owner-or-sibling short circuit without a membership fetch.
+        let response =
+            serde_json::json!([{ "tags": [["d", channel_id.to_string()], ["p", EXTERNAL]] }]);
+        let (member_resolver, _requests, server) =
+            member_resolver_with_script(vec![(200, response)]).await;
+        let cache = cache_with_sibling();
+        for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
+            assert!(
+                author_allowed(
+                    &RespondTo::Members,
+                    &HashSet::new(),
+                    who,
+                    false,
+                    &cache,
+                    &dummy_rest_client(),
+                    channel_id,
+                    &member_resolver,
+                )
+                .await,
+                "the {label} must be admitted under Members even when not listed as a channel member"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_members_fails_closed_and_does_not_negative_cache() {
+        use std::sync::atomic::Ordering;
+
+        let channel_id = Uuid::new_v4();
+        let member_response =
+            serde_json::json!([{ "tags": [["d", channel_id.to_string()], ["p", EXTERNAL]] }]);
+        // First fetch (2 attempts: fetch + retry) fails with HTTP 500; the
+        // next fetch succeeds. EXTERNAL must be dropped while resolution
+        // fails, then admitted on the retried fetch — proving the failure
+        // was not negatively cached.
+        let script = vec![
+            (500, serde_json::json!(null)),
+            (500, serde_json::json!(null)),
+            (200, member_response),
+        ];
+        let (member_resolver, requests, server) = member_resolver_with_script(script).await;
+        let cache = cache_with_sibling();
+
+        assert!(
+            !author_allowed(
+                &RespondTo::Members,
+                &HashSet::new(),
+                EXTERNAL,
+                false,
+                &cache,
+                &dummy_rest_client(),
+                channel_id,
+                &member_resolver,
+            )
+            .await,
+            "membership fetch failure must drop the event (fail closed)"
+        );
+        assert!(
+            author_allowed(
+                &RespondTo::Members,
+                &HashSet::new(),
+                EXTERNAL,
+                false,
+                &cache,
+                &dummy_rest_client(),
+                channel_id,
+                &member_resolver,
+            )
+            .await,
+            "a later event must retry the fetch — failures must not be cached"
+        );
+        assert!(
+            requests.load(Ordering::SeqCst) >= 3,
+            "expected at least 3 member fetches (2 failed attempts + 1 success)"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_members_dm_behavior_unchanged() {
+        let channel_id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", channel_id.to_string()], ["p", EXTERNAL], ["p", OWNER]]
+        }]);
+        let (member_resolver, _requests, server) =
+            member_resolver_with_script(vec![(200, response)]).await;
+        let cache = cache_with_sibling();
+
+        assert!(
+            !author_allowed(
+                &RespondTo::Members,
+                &HashSet::new(),
+                EXTERNAL,
+                true,
+                &cache,
+                &dummy_rest_client(),
+                channel_id,
+                &member_resolver,
+            )
+            .await,
+            "a channel member who is not owner/sibling must NOT fire a turn inside a DM under Members"
+        );
+        for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
+            assert!(
+                author_allowed(
+                    &RespondTo::Members,
+                    &HashSet::new(),
+                    who,
+                    true,
+                    &cache,
+                    &dummy_rest_client(),
+                    channel_id,
+                    &member_resolver,
+                )
+                .await,
+                "the {label} must still be admitted in a DM under Members"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_anyone_ignores_membership() {
+        // Regression: `anyone` must still forward every non-DM author without
+        // consulting the membership resolver.
+        let cache = cache_with_sibling();
+        assert!(
+            author_allowed(
+                &RespondTo::Anyone,
+                &HashSet::new(),
+                STRANGER,
+                false,
+                &cache,
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
+            )
+            .await,
+            "respond_to=anyone must forward non-DM authors regardless of membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nobody_ignores_membership() {
+        // Regression: `nobody` must drop everything regardless of membership.
+        let cache = cache_with_sibling();
+        assert!(
+            !author_allowed(
+                &RespondTo::Nobody,
+                &HashSet::new(),
+                OWNER,
+                false,
+                &cache,
+                &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
+            )
+            .await,
+            "respond_to=nobody must drop even a channel-member owner"
         );
     }
 
@@ -5734,6 +6082,8 @@ mod author_gate_tests {
                 is_dm,
                 &owner_cache,
                 &dummy_rest_client(),
+                Uuid::nil(),
+                &dummy_member_resolver(),
             )
             .await,
             "an external author must not pass when startup discovery omitted metadata"

@@ -384,6 +384,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let rest_client = relay.rest_client();
 
     let channel_info = crate::pool::ChannelInfoResolver::new(channel_info_map, rest_client.clone());
+    let member_resolver = crate::pool::MemberResolver::new(rest_client.clone());
 
     // Deduplicate by event-id so reconnect replay cannot double-nudge.
     let mut nudged_event_ids: HashSet<EventId> = HashSet::new();
@@ -437,6 +438,8 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
             is_dm,
             &owner_cache,
             &rest_client,
+            buzz_event.channel_id,
+            &member_resolver,
         )
         .await;
 
