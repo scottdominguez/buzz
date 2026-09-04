@@ -423,6 +423,47 @@ impl RestClient {
             .map_err(|e| RelayError::Http(e.to_string()))
     }
 
+    /// Query the current member set of a channel via the HTTP bridge.
+    ///
+    /// Fetches the latest kind:39002 (NIP-29 group members) event for the
+    /// channel's `d` tag and collects the pubkeys listed in its `p` tags
+    /// (lowercased). Returns an empty set when the channel has no members
+    /// event or no `p` tags; `Err` on transport/relay failure.
+    pub async fn channel_members(&self, channel_id: Uuid) -> Result<HashSet<String>, RelayError> {
+        use nostr::{Alphabet, SingleLetterTag};
+
+        let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+        let filter = nostr::Filter::new()
+            .kind(nostr::Kind::Custom(
+                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+            ))
+            .custom_tags(d_tag, [channel_id.to_string()])
+            .limit(1);
+
+        let resp = self.query(&[filter]).await?;
+        let events = resp.as_array().ok_or_else(|| {
+            RelayError::Http(format!(
+                "expected JSON array from /query (channel members for {channel_id})"
+            ))
+        })?;
+
+        let mut members = HashSet::new();
+        if let Some(ev) = events.first() {
+            if let Some(tags) = ev.get("tags").and_then(|t| t.as_array()) {
+                for tag in tags {
+                    if let Some(arr) = tag.as_array() {
+                        if arr.first().and_then(|v| v.as_str()) == Some("p") {
+                            if let Some(pk) = arr.get(1).and_then(|v| v.as_str()) {
+                                members.insert(pk.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(members)
+    }
+
     /// Count events via the HTTP bridge: `POST /count` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).

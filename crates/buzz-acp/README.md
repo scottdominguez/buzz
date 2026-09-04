@@ -146,7 +146,7 @@ Controls which authors' events the harness forwards to the agent. Events from di
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `allowlist`, `anyone`, `nobody`. |
+| `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `allowlist`, `members`, `anyone`, `nobody`. |
 | `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is always implicitly included. |
 
 **Modes:**
@@ -155,6 +155,7 @@ Controls which authors' events the harness forwards to the agent. Events from di
 |------|----------|
 | `owner-only` | Forward only events from the agent's registered owner. If no owner is set, all events are dropped until the owner is resolved. |
 | `allowlist` | Forward events from the listed pubkeys plus the owner. |
+| `members` | Forward events from the owner/same-owner siblings plus **current members of the event's channel**. Membership is resolved from the relay REST API (kind:39002 group-members events) with a bounded TTL cache, invalidated immediately on membership notifications. **Fail-closed:** if membership cannot be resolved (fetch error/timeout), the event is dropped with a warning and the failure is not cached, so a later event retries. DM behavior is unchanged — inside DMs only owner/same-owner siblings fire turns. |
 | `anyone` | Forward all events (no author filtering). |
 | `nobody` | Drop all inbound events. Agent only acts on heartbeat prompts. |
 
@@ -181,6 +182,10 @@ buzz-acp
 # Respond to a team of three users (owner always included automatically)
 buzz-acp --respond-to allowlist \
   --respond-to-allowlist "abc123...64hex,def456...64hex,789abc...64hex"
+
+# Respond to current channel members (defense-in-depth on top of the relay's
+# own member enforcement; fail-closed on membership resolution errors)
+buzz-acp --respond-to members
 
 # Respond to anyone (open agent)
 buzz-acp --respond-to anyone

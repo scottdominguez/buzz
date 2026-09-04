@@ -597,6 +597,82 @@ impl ChannelInfoResolver {
     }
 }
 
+/// TTL for cached channel-member sets. Membership changes are picked up within
+/// this window without a restart; membership notifications also invalidate the
+/// channel immediately (see [`MemberResolver::invalidate`]).
+const MEMBER_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Upper bound on cached channel entries. Membership churn across many channels
+/// is rare, so evicting the whole cache when the cap is hit is acceptable and
+/// keeps the structure bounded.
+const MEMBER_CACHE_MAX_ENTRIES: usize = 512;
+
+/// Resolves whether an author is a current member of a channel, with a bounded
+/// TTL cache.
+///
+/// Mirrors [`ChannelInfoResolver`]: successful lookups are cached (with a TTL
+/// so member changes are picked up without a restart), failures are never
+/// cached so a later event retries. Consumers must fail closed on `None` —
+/// membership could not be resolved.
+#[derive(Debug, Clone)]
+pub struct MemberResolver {
+    cache: Arc<Mutex<HashMap<Uuid, CachedMemberSet>>>,
+    rest_client: RestClient,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMemberSet {
+    members: HashSet<String>,
+    fetched_at: std::time::Instant,
+}
+
+impl MemberResolver {
+    pub fn new(rest_client: RestClient) -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            rest_client,
+        }
+    }
+
+    /// Returns `Some(true)`/`Some(false)` when membership was resolved, `None`
+    /// when the fetch failed (the caller must fail closed). Failures are never
+    /// cached, so a later event retries the fetch.
+    pub async fn is_member(&self, channel_id: Uuid, author: &str) -> Option<bool> {
+        {
+            let cache = self.cache.lock().ok()?;
+            if let Some(entry) = cache.get(&channel_id) {
+                if entry.fetched_at.elapsed() < MEMBER_CACHE_TTL {
+                    return Some(entry.members.contains(author));
+                }
+            }
+        }
+
+        let members = fetch_channel_members(channel_id, &self.rest_client).await?;
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() >= MEMBER_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(
+                channel_id,
+                CachedMemberSet {
+                    members: members.clone(),
+                    fetched_at: std::time::Instant::now(),
+                },
+            );
+        }
+        Some(members.contains(author))
+    }
+
+    /// Drop the cached member set for a channel so the next event re-fetches.
+    /// Called on membership notifications (add/remove) so changes are effective
+    /// immediately rather than after up to [`MEMBER_CACHE_TTL`].
+    pub fn invalidate(&self, channel_id: Uuid) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(&channel_id);
+        }
+    }
+}
+
 pub struct PromptContext {
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
@@ -627,6 +703,8 @@ pub struct PromptContext {
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
     pub channel_info: ChannelInfoResolver,
+    /// Shared channel-member resolution for the `respond_to=members` author gate.
+    pub member_resolver: MemberResolver,
     /// Max messages to include in thread/DM context. 0 = disabled.
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
@@ -3270,6 +3348,39 @@ pub(crate) async fn fetch_channel_info(
                 tracing::debug!(
                     channel_id = %channel_id,
                     "channel info fetch timed out — will retry"
+                );
+                None
+            }
+        }
+    })
+    .await
+}
+
+/// Fetch the current member set of a channel via the relay REST API.
+///
+/// Uses `CONTEXT_FETCH_TIMEOUT` with one retry on failure. Returns `None` on
+/// persistent failure — the caller must fail closed (drop the event) and must
+/// NOT cache the result, so a later event retries.
+pub(crate) async fn fetch_channel_members(
+    channel_id: Uuid,
+    rest: &RestClient,
+) -> Option<HashSet<String>> {
+    fetch_with_retry(|| async {
+        match timeout(CONTEXT_FETCH_TIMEOUT, rest.channel_members(channel_id)).await {
+            Ok(Ok(members)) => Some(members),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    "respond_to=members: channel member fetch failed: {e} — \
+                     dropping event (fail closed), not caching so later events retry"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    "respond_to=members: channel member fetch timed out — \
+                     dropping event (fail closed), not caching so later events retry"
                 );
                 None
             }
@@ -8712,6 +8823,12 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     auth_tag_json: None,
                 },
             ),
+            member_resolver: MemberResolver::new(RestClient {
+                http: reqwest::Client::new(),
+                base_url: "http://127.0.0.1:0".to_string(),
+                keys: agent_keys.clone(),
+                auth_tag_json: None,
+            }),
             context_message_limit: 0,
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,
@@ -10059,5 +10176,134 @@ done"#
             cap["configOptions"].is_null(),
             "an optionless switch caches the target's (empty) options, never the pre-switch model-a options with a patched effort"
         );
+    }
+}
+
+#[cfg(test)]
+mod member_resolver_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Local HTTP server serving a script of `(status, body)` responses, one
+    /// per request; requests beyond the script get a 200 empty JSON array.
+    /// Returns the resolver, a request counter, and the server task handle.
+    async fn member_server(
+        script: Vec<(u16, serde_json::Value)>,
+    ) -> (
+        MemberResolver,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let script = Arc::new(StdMutex::new(script));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = {
+                    let mut script = script.lock().unwrap();
+                    if script.is_empty() {
+                        (200u16, "[]".to_string())
+                    } else {
+                        let (status, body) = script.remove(0);
+                        (status, body.to_string())
+                    }
+                };
+                let status_line = if status == 200 {
+                    "200 OK".to_string()
+                } else {
+                    format!("{status} Error")
+                };
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (MemberResolver::new(rest), requests, server)
+    }
+
+    fn member_event(channel_id: Uuid, members: &[&str]) -> serde_json::Value {
+        let mut tags: Vec<serde_json::Value> = vec![json!(["d", channel_id.to_string()])];
+        for member in members {
+            tags.push(json!(["p", member]));
+        }
+        json!([{ "tags": tags }])
+    }
+
+    #[tokio::test]
+    async fn is_member_caches_successful_lookup() {
+        let channel_id = Uuid::new_v4();
+        let (resolver, requests, server) =
+            member_server(vec![(200, member_event(channel_id, &["aa"]))]).await;
+        assert_eq!(resolver.is_member(channel_id, "aa").await, Some(true));
+        assert_eq!(resolver.is_member(channel_id, "bb").await, Some(false));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "second lookup must hit the cache"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn is_member_invalidate_refetches() {
+        let channel_id = Uuid::new_v4();
+        // First fetch says "aa" is a member; after invalidate, a second fetch
+        // (still within TTL) re-queries and now says "aa" is gone.
+        let script = vec![
+            (200, member_event(channel_id, &["aa"])),
+            (200, member_event(channel_id, &["bb"])),
+        ];
+        let (resolver, requests, server) = member_server(script).await;
+        assert_eq!(resolver.is_member(channel_id, "aa").await, Some(true));
+        resolver.invalidate(channel_id);
+        assert_eq!(resolver.is_member(channel_id, "aa").await, Some(false));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "invalidate must force a refetch"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn is_member_treats_missing_members_event_as_empty() {
+        let channel_id = Uuid::new_v4();
+        let (resolver, _requests, server) = member_server(vec![(200, json!([]))]).await;
+        assert_eq!(resolver.is_member(channel_id, "aa").await, Some(false));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn is_member_fails_closed_on_fetch_error() {
+        let channel_id = Uuid::new_v4();
+        // Both fetch attempts (fetch + retry) fail — resolve as None so the
+        // author gate can drop the event (fail closed).
+        let (resolver, _requests, server) =
+            member_server(vec![(500, json!(null)), (500, json!(null))]).await;
+        assert_eq!(resolver.is_member(channel_id, "aa").await, None);
+        server.abort();
     }
 }
