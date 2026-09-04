@@ -3041,6 +3041,36 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn spawn_executable_test_adapter(
+        path: &std::path::Path,
+        extra_env: &[(String, String)],
+    ) -> Result<AcpClient, AcpError> {
+        let mut spawn_attempt = 0;
+        loop {
+            spawn_attempt += 1;
+            match AcpClient::spawn(
+                path.to_str().expect("test adapter path is UTF-8"),
+                &[],
+                extra_env,
+                false,
+            )
+            .await
+            {
+                Ok(client) => return Ok(client),
+                Err(AcpError::Io(error))
+                    if error.raw_os_error() == Some(26) && spawn_attempt < 3 =>
+                {
+                    // Some parallel-test filesystems briefly retain the write
+                    // lease after chmod and return ETXTBSY on exec. Keep this
+                    // test-only recovery short and bounded.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3058,7 +3088,7 @@ mod tests {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake adapter");
-        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false)
+        let client = spawn_executable_test_adapter(&path, &[])
             .await
             .expect("spawn named fake adapter");
         (client, dir)
@@ -3087,14 +3117,9 @@ mod tests {
         permissions.set_mode(0o700);
         std::fs::set_permissions(&path, permissions).expect("chmod probe");
 
-        let mut client = AcpClient::spawn(
-            path.to_str().expect("probe path is UTF-8"),
-            &[],
-            extra_env,
-            false,
-        )
-        .await
-        .expect("spawn env probe script");
+        let mut client = spawn_executable_test_adapter(&path, extra_env)
+            .await
+            .expect("spawn env probe script");
         let observed = client
             .reader
             .next()

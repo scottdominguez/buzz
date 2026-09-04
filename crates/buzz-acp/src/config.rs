@@ -96,7 +96,6 @@ pub enum RespondTo {
     #[default]
     OwnerOnly,
     Allowlist,
-    #[value(alias = "members")]
     Anyone,
     Nobody,
 }
@@ -1058,21 +1057,16 @@ impl Config {
 
         // Validate respond_to against the allowed set.
         let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
-            // Parse and canonicalize aliases before comparing them. This keeps
-            // a legacy `members` policy aligned with RespondTo::Anyone.
-            let allowed_modes: Vec<String> = raw
-                .iter()
-                .map(|s| {
-                    RespondTo::from_str(s.trim(), true)
-                        .map(|mode| mode.to_string())
-                        .map_err(|_| {
-                            ConfigError::ConfigFile(format!(
-                                "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                                 (valid values: owner-only, allowlist, anyone, nobody)"
-                            ))
-                        })
-                })
-                .collect::<Result<_, _>>()?;
+            // Validate each entry is a known RespondTo mode.
+            for s in &raw {
+                RespondTo::from_str(s.trim(), true).map_err(|_| {
+                    ConfigError::ConfigFile(format!(
+                        "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
+                         (valid values: owner-only, allowlist, anyone, nobody)"
+                    ))
+                })?;
+            }
+            let allowed_modes: Vec<String> = raw.iter().map(|s| s.trim().to_string()).collect();
             if !allowed_modes.is_empty() && !allowed_modes.contains(&args.respond_to.to_string()) {
                 return Err(ConfigError::ConfigFile(format!(
                     "respond_to '{}' is not permitted on this deployment \
@@ -2885,21 +2879,6 @@ channels = "ALL"
             result.is_ok(),
             "from_args should accept respond_to=owner-only when in allowed set: {result:?}"
         );
-    }
-
-    #[test]
-    fn members_alias_is_allowed_by_members_policy() {
-        let args = CliArgs::try_parse_from([
-            "buzz-acp",
-            "--private-key",
-            TEST_PRIVATE_KEY,
-            "--respond-to",
-            "members",
-            "--allowed-respond-to",
-            "members",
-        ])
-        .expect("members alias should parse");
-        assert!(Config::from_args(args).is_ok());
     }
 
     #[test]
