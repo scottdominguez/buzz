@@ -492,7 +492,7 @@ fn managed_agent_directory_uses_the_latest_profile_head() {
 }
 
 #[test]
-fn managed_agent_candidates_use_only_relay_signed_bot_membership() {
+fn managed_agent_candidates_use_relay_signed_membership_independent_of_role() {
     let relay_keys = Keys::generate();
     let agent_pubkey = Keys::generate().public_key().to_hex();
     let stranger = Keys::generate().public_key().to_hex();
@@ -517,7 +517,16 @@ fn managed_agent_candidates_use_only_relay_signed_bot_membership() {
         channel_ids.get(&agent_pubkey),
         Some(&vec!["family".to_string()])
     );
-    assert!(!channel_ids.contains_key(&stranger));
+    // Membership role is not an identity type. Headless agents may be regular
+    // members; signed directory/profile resolution determines which candidates
+    // are agents. Forged membership must still never supply channel IDs.
+    assert_eq!(
+        channel_ids.get(&stranger),
+        Some(&vec!["family".to_string()])
+    );
+    assert!(channel_ids
+        .values()
+        .all(|ids| !ids.contains(&"forged".to_string())));
 }
 
 #[test]

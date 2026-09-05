@@ -157,7 +157,9 @@ pub fn relay_agents_from_managed_agent_events(
 }
 
 /// Build a pubkey-to-channel-id candidate map from relay-signed membership
-/// events. Only p-tags explicitly marked with the `bot` role are agents.
+/// events. Membership roles are not identity types: headless agents can be
+/// ordinary members. Signed directory/profile resolution filters these candidates
+/// to actual agents; this map only establishes authoritative channel membership.
 pub fn member_agent_channel_ids_from_events(
     events: &[Event],
     relay_pubkey: &str,
@@ -171,10 +173,10 @@ pub fn member_agent_channel_ids_from_events(
             continue;
         };
         for tag in tags_named(event, "p") {
-            let (Some(pubkey), Some(role)) = (tag.get(1), tag.get(3)) else {
+            let Some(pubkey) = tag.get(1) else {
                 continue;
             };
-            if role != "bot" || nostr::PublicKey::from_hex(pubkey).is_err() {
+            if nostr::PublicKey::from_hex(pubkey).is_err() {
                 continue;
             }
             channel_ids
