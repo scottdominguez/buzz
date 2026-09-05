@@ -27,6 +27,10 @@ const MAX_PENDING_PER_CHANNEL: usize = 500;
 /// Maximum events drained into a single batch.
 const MAX_BATCH_EVENTS: usize = 50;
 
+/// Maximum passive FYI/context events retained per channel while waiting for
+/// the next admitted turn.
+const MAX_PASSIVE_CONTEXT_PER_CHANNEL: usize = 50;
+
 /// Maximum retry attempts before a batch is dead-lettered.
 pub(crate) const MAX_RETRIES: u32 = 10;
 
@@ -71,6 +75,10 @@ pub enum CancelReason {
     /// and incorporate the message if relevant
     /// (`MultipleEventHandling::Steer`, the default mid-turn path).
     Steer,
+    /// `cancelled_events` carries passive FYI/context events rather than a
+    /// cancelled request. This reuses the existing supplementary-event slot
+    /// without allowing passive events to become dispatch candidates.
+    PassiveContext,
 }
 
 /// A batch of events to prompt the agent with.
@@ -78,15 +86,14 @@ pub enum CancelReason {
 pub struct FlushBatch {
     pub channel_id: Uuid,
     pub events: Vec<BatchEvent>,
-    /// Events from a cancelled batch that triggered this re-prompt.
-    /// Empty for normal (non-cancel) batches. When non-empty, `format_prompt()`
-    /// produces a merged prompt with annotated sections, framed per
-    /// [`cancel_reason`](Self::cancel_reason).
+    /// Supplementary events from a cancelled batch or the passive-context
+    /// buffer. Empty for ordinary batches. When non-empty, `format_prompt()`
+    /// produces annotated sections framed per [`cancel_reason`](Self::cancel_reason).
     pub cancelled_events: Vec<BatchEvent>,
-    /// How the prior turn was cancelled, when [`cancelled_events`] is non-empty.
-    /// `None` for normal (non-merge) batches; falls back to the gentler
-    /// [`Steer`](CancelReason::Steer) framing if a merge somehow lacks a reason
-    /// (see [`MergeFraming::for_reason`]).
+    /// Why supplementary events are present. This is a cancellation cause or
+    /// [`PassiveContext`](CancelReason::PassiveContext). `None` for normal
+    /// batches; a merge without a reason falls back to the gentler
+    /// [`Steer`](CancelReason::Steer) framing (see [`MergeFraming::for_reason`]).
     pub cancel_reason: Option<CancelReason>,
 }
 
@@ -137,6 +144,11 @@ pub struct FlushBatch {
 /// ```
 pub struct EventQueue {
     queues: HashMap<Uuid, VecDeque<QueuedEvent>>,
+    /// Pre-work collection deadline keyed by channel. Created only when the
+    /// first event arrives for an idle channel; events arriving while a turn
+    /// is active never receive a new coalescing delay.
+    coalescing_deadlines: HashMap<Uuid, Instant>,
+    coalescing_window: Duration,
     in_flight_channels: HashSet<Uuid>,
     /// Per-channel deadline for auto-expiring stuck in-flight entries.
     in_flight_deadlines: HashMap<Uuid, Instant>,
@@ -154,6 +166,9 @@ pub struct EventQueue {
     /// Set by `requeue_as_cancelled`, consumed by `flush_next` to set
     /// `FlushBatch::cancel_reason`. Keyed by channel, cleared on flush.
     cancel_reasons: HashMap<Uuid, CancelReason>,
+    /// Classified FYI/context events waiting for the next admitted turn. This
+    /// table is deliberately invisible to all flushability checks.
+    passive_context: HashMap<Uuid, VecDeque<BatchEvent>>,
     /// Events withheld from `queues` while a goose-native steer is in flight
     /// for that event. Invisible to `flush_next` / `has_flushable_work` /
     /// `drain` (the events have been moved out of `queues`), so the queue's
@@ -186,6 +201,8 @@ impl EventQueue {
     pub fn new(dedup_mode: DedupMode) -> Self {
         Self {
             queues: HashMap::new(),
+            coalescing_deadlines: HashMap::new(),
+            coalescing_window: Duration::ZERO,
             in_flight_channels: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
@@ -194,6 +211,7 @@ impl EventQueue {
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
+            passive_context: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
             turn_states: TurnStateMachine::new(),
@@ -205,6 +223,13 @@ impl EventQueue {
     pub fn with_in_flight_deadline(mut self, max_turn_duration_secs: u64) -> Self {
         self.in_flight_deadline =
             Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+        self
+    }
+
+    /// Set the bounded delay used to gather events that arrive before work
+    /// begins. `Duration::ZERO` preserves immediate dispatch.
+    pub fn with_coalescing_window(mut self, window: Duration) -> Self {
+        self.coalescing_window = window;
         self
     }
 
@@ -245,8 +270,31 @@ impl EventQueue {
             );
             return false;
         }
-        self.turn_states.on_event_queued(event.channel_id);
-        let queue = self.queues.entry(event.channel_id).or_default();
+        let channel_id = event.channel_id;
+        self.turn_states.on_event_queued(channel_id);
+        let queue_was_empty = self.queues.get(&channel_id).is_none_or(VecDeque::is_empty);
+        if queue_was_empty
+            && !self.in_flight_channels.contains(&channel_id)
+            && !self.coalescing_window.is_zero()
+        {
+            let deadline = event.received_at + self.coalescing_window;
+            self.coalescing_deadlines.insert(channel_id, deadline);
+            tracing::debug!(
+                %channel_id,
+                event_id = %event.event.id.to_hex(),
+                window_ms = self.coalescing_window.as_millis(),
+                decision = "coalesce",
+                "opened bounded pre-work coalescing window"
+            );
+        } else if self.coalescing_deadlines.contains_key(&channel_id) {
+            tracing::debug!(
+                %channel_id,
+                event_id = %event.event.id.to_hex(),
+                decision = "coalesce",
+                "joined existing pre-work coalescing window"
+            );
+        }
+        let queue = self.queues.entry(channel_id).or_default();
         // Enforce per-channel depth cap: drop oldest to make room.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
             queue.pop_front();
@@ -260,6 +308,28 @@ impl EventQueue {
         true
     }
 
+    /// Retain an event as passive context for the next admitted turn.
+    ///
+    /// Passive context never participates in flushability, fairness, steering,
+    /// or loop guards and therefore cannot independently start work.
+    pub fn attach_context(&mut self, event: QueuedEvent) {
+        let channel_id = event.channel_id;
+        let context = self.passive_context.entry(channel_id).or_default();
+        if context.len() >= MAX_PASSIVE_CONTEXT_PER_CHANNEL {
+            context.pop_front();
+            tracing::warn!(
+                %channel_id,
+                limit = MAX_PASSIVE_CONTEXT_PER_CHANNEL,
+                "passive context cap reached — dropped oldest FYI event"
+            );
+        }
+        context.push_back(BatchEvent {
+            event: event.event,
+            prompt_tag: event.prompt_tag,
+            received_at: event.received_at,
+        });
+    }
+
     /// Try to flush the next batch.
     ///
     /// Returns `None` if all non-in-flight, non-throttled queues are empty.
@@ -267,8 +337,12 @@ impl EventQueue {
     /// across channels), drains ALL events for that channel into a single batch,
     /// inserts into `in_flight_channels`, and returns the batch.
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
-        let now = Instant::now();
+        self.flush_next_at(Instant::now())
+    }
 
+    /// Clock-injected form of [`flush_next`](Self::flush_next), used by the
+    /// deterministic coalescing and conversation simulations.
+    pub fn flush_next_at(&mut self, now: Instant) -> Option<FlushBatch> {
         // Auto-expire any stuck in-flight entries that missed mark_complete.
         let expired: Vec<Uuid> = self
             .in_flight_deadlines
@@ -307,6 +381,7 @@ impl EventQueue {
                 !q.is_empty()
                     && !self.in_flight_channels.contains(id)
                     && self.retry_after.get(id).is_none_or(|&t| t <= now)
+                    && self.coalescing_deadlines.get(id).is_none_or(|&t| t <= now)
             })
             .min_by_key(|(_, q)| q.front().unwrap().received_at)
             .map(|(id, _)| *id);
@@ -332,6 +407,7 @@ impl EventQueue {
                         self.in_flight_deadlines
                             .insert(id, now + self.in_flight_deadline);
                         self.in_flight_batch_sizes.insert(id, cancelled.len());
+                        self.coalescing_deadlines.remove(&id);
                         return Some(FlushBatch {
                             channel_id: id,
                             events: cancelled,
@@ -346,6 +422,7 @@ impl EventQueue {
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
         let queue = self.queues.entry(channel_id).or_default();
+        self.coalescing_deadlines.remove(&channel_id);
         let drain_count = MAX_BATCH_EVENTS.min(queue.len());
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
@@ -371,16 +448,24 @@ impl EventQueue {
             .insert(channel_id, now + self.in_flight_deadline);
         self.in_flight_batch_sizes.insert(channel_id, events.len());
         // Merge any cancelled events stored by requeue_as_cancelled().
-        let cancelled_events = self
+        let mut cancelled_events = self
             .cancelled_batches
             .remove(&channel_id)
             .unwrap_or_default();
-        let cancel_reason = if cancelled_events.is_empty() {
+        let mut cancel_reason = if cancelled_events.is_empty() {
             self.cancel_reasons.remove(&channel_id);
             None
         } else {
             self.cancel_reasons.remove(&channel_id)
         };
+        if cancelled_events.is_empty() {
+            if let Some(context) = self.passive_context.remove(&channel_id) {
+                cancelled_events.extend(context);
+                if !cancelled_events.is_empty() {
+                    cancel_reason = Some(CancelReason::PassiveContext);
+                }
+            }
+        }
 
         Some(FlushBatch {
             channel_id,
@@ -442,6 +527,9 @@ impl EventQueue {
     /// `mark_complete` separately.
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
+        if batch.cancel_reason == Some(CancelReason::PassiveContext) {
+            self.restore_passive_context(channel_id, batch.cancelled_events.clone());
+        }
         let attempt = {
             let count = self.retry_counts.entry(channel_id).or_insert(0);
             *count += 1;
@@ -521,6 +609,9 @@ impl EventQueue {
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
         let channel_id = batch.channel_id;
+        if batch.cancel_reason == Some(CancelReason::PassiveContext) {
+            self.restore_passive_context(channel_id, batch.cancelled_events.clone());
+        }
         let queue = self.queues.entry(channel_id).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
@@ -554,11 +645,28 @@ impl EventQueue {
     /// the generic queue — they are stored separately and merged by
     /// `flush_next()`. No retry throttle, no backoff.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
-        let entry = self.cancelled_batches.entry(batch.channel_id).or_default();
         // Preserve any already-cancelled events from a prior cancel (double-cancel).
-        entry.extend(batch.cancelled_events);
+        if batch.cancel_reason == Some(CancelReason::PassiveContext) {
+            self.restore_passive_context(batch.channel_id, batch.cancelled_events);
+        } else {
+            self.cancelled_batches
+                .entry(batch.channel_id)
+                .or_default()
+                .extend(batch.cancelled_events);
+        }
+        let entry = self.cancelled_batches.entry(batch.channel_id).or_default();
         entry.extend(batch.events);
         self.cancel_reasons.insert(batch.channel_id, reason);
+    }
+
+    fn restore_passive_context(&mut self, channel_id: Uuid, events: Vec<BatchEvent>) {
+        let context = self.passive_context.entry(channel_id).or_default();
+        for event in events.into_iter().rev() {
+            context.push_front(event);
+        }
+        while context.len() > MAX_PASSIVE_CONTEXT_PER_CHANNEL {
+            context.pop_back();
+        }
     }
 
     /// Returns `true` if any channel has pending events that are not in-flight
@@ -568,8 +676,12 @@ impl EventQueue {
     /// This is a `&mut self` method so expiry can happen without requiring a
     /// full `flush_next` call.
     pub fn has_flushable_work(&mut self) -> bool {
-        let now = Instant::now();
+        self.has_flushable_work_at(Instant::now())
+    }
 
+    /// Clock-injected form of
+    /// [`has_flushable_work`](Self::has_flushable_work).
+    pub fn has_flushable_work_at(&mut self, now: Instant) -> bool {
         // Auto-expire stuck in-flight entries (same logic as flush_next).
         let expired: Vec<Uuid> = self
             .in_flight_deadlines
@@ -599,6 +711,7 @@ impl EventQueue {
             !q.is_empty()
                 && !self.in_flight_channels.contains(id)
                 && self.retry_after.get(id).is_none_or(|&t| t <= now)
+                && self.coalescing_deadlines.get(id).is_none_or(|&t| t <= now)
         }) || self
             .cancelled_batches
             .keys()
@@ -636,6 +749,27 @@ impl EventQueue {
             .iter()
             .any(|(id, v)| !v.is_empty() && !self.in_flight_channels.contains(id));
         has_queued || has_cancelled || has_withheld
+    }
+
+    /// Earliest instant at which currently queued idle work can become ready
+    /// after its pre-work coalescing or retry delay. The main loop sleeps on
+    /// this deadline so a lone event cannot remain stranded on a quiet relay
+    /// connection.
+    pub fn next_flush_deadline(&self) -> Option<Instant> {
+        self.queues
+            .iter()
+            .filter(|(id, queue)| !queue.is_empty() && !self.in_flight_channels.contains(id))
+            .filter_map(|(id, _)| {
+                match (
+                    self.coalescing_deadlines.get(id).copied(),
+                    self.retry_after.get(id).copied(),
+                ) {
+                    (Some(coalesce), Some(retry)) => Some(coalesce.max(retry)),
+                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                    (None, None) => None,
+                }
+            })
+            .min()
     }
 
     /// Number of channels with pending events.
@@ -677,9 +811,11 @@ impl EventQueue {
             .map(|q| q.into_iter().map(|e| e.event.id.to_hex()).collect())
             .unwrap_or_default();
         self.retry_after.remove(&channel_id);
+        self.coalescing_deadlines.remove(&channel_id);
         self.retry_counts.remove(&channel_id);
         self.cancelled_batches.remove(&channel_id);
         self.cancel_reasons.remove(&channel_id);
+        self.passive_context.remove(&channel_id);
         self.withheld_native_steer.remove(&channel_id);
         // The agent is gone from this channel — settle the per-session turn
         // state so stale steer/complete transitions cannot resurrect it.
@@ -1699,11 +1835,24 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //    - `Interrupt`: the new request *supersedes* the interrupted work.
     //    - `Steer` (default): a message arrived while the agent was working; it
     //      should *continue* its work and weave the message in if relevant.
-    let has_cancelled = !batch.cancelled_events.is_empty();
+    let has_passive_context = batch.cancel_reason == Some(CancelReason::PassiveContext)
+        && !batch.cancelled_events.is_empty();
+    let has_cancelled = !batch.cancelled_events.is_empty() && !has_passive_context;
     let framing = MergeFraming::for_reason(batch.cancel_reason);
 
     // 4a. Cancelled events section.
-    if has_cancelled {
+    if has_passive_context {
+        let mut s = "[Passive context / FYI — no response requested]".to_string();
+        for (i, be) in batch.cancelled_events.iter().enumerate() {
+            s.push_str(&format!(
+                "\n\n--- Context {} ({}) ---\n{}",
+                i + 1,
+                be.prompt_tag,
+                format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+            ));
+        }
+        sections.push(s);
+    } else if has_cancelled {
         let mut s = framing.prior_header.to_string();
         for (i, be) in batch.cancelled_events.iter().enumerate() {
             s.push_str(&format!(
@@ -1805,6 +1954,12 @@ impl MergeFraming {
                 closing_note: "Note: The previous request was interrupted. Please address the new \
                      request.\nIf the new request is unrelated to the previous one, you may \
                      briefly acknowledge the interruption.",
+            },
+            Some(CancelReason::PassiveContext) => MergeFraming {
+                prior_header: "[Passive context / FYI — no response requested]",
+                new_header_single: "[Buzz event]",
+                new_header_multi_prefix: "[Buzz events",
+                closing_note: "",
             },
         }
     }

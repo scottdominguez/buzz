@@ -40,6 +40,14 @@ pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
 pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 
+/// Default pre-work event coalescing window. Kept deliberately short so a
+/// single message remains responsive while simultaneous relay deliveries can
+/// share one turn.
+pub const DEFAULT_COALESCE_WINDOW_MS: u64 = 100;
+/// Hard ceiling for the coalescing window; this is latency smoothing, not a
+/// scheduler or a long-lived debounce.
+pub const MAX_COALESCE_WINDOW_MS: u64 = 5_000;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to parse nostr keys: {0}")]
@@ -383,6 +391,16 @@ pub struct CliArgs {
     )]
     pub multiple_event_handling: MultipleEventHandling,
 
+    /// Milliseconds to collect eligible events for an idle channel before its
+    /// turn starts. The deadline begins with the first event; 0 disables.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_COALESCE_WINDOW_MS",
+        default_value_t = DEFAULT_COALESCE_WINDOW_MS,
+        value_parser = clap::value_parser!(u64).range(0..=MAX_COALESCE_WINDOW_MS)
+    )]
+    pub coalesce_window_ms: u64,
+
     #[arg(long, env = "BUZZ_ACP_NO_IGNORE_SELF")]
     pub no_ignore_self: bool,
 
@@ -593,6 +611,8 @@ pub struct Config {
     pub subscribe_mode: SubscribeMode,
     pub dedup_mode: DedupMode,
     pub multiple_event_handling: MultipleEventHandling,
+    /// Pre-work event coalescing window in milliseconds. `0` disables.
+    pub coalesce_window_ms: u64,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
     pub channels_override: Option<Vec<String>>,
@@ -1182,6 +1202,7 @@ impl Config {
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
             multiple_event_handling: args.multiple_event_handling,
+            coalesce_window_ms: args.coalesce_window_ms,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
             channels_override: args.channels,
@@ -1240,7 +1261,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} multiple_event_handling={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {} {} loop_guards=(max_agent_chain={}, pingpong_limit={}, pingpong_cooldown={}s, agent_reply_rate={}/min, agent_reply_cooldown={}s)",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} multiple_event_handling={:?} coalesce_window={}ms ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {} {} loop_guards=(max_agent_chain={}, pingpong_limit={}, pingpong_cooldown={}s, agent_reply_rate={}/min, agent_reply_cooldown={}s)",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1253,6 +1274,7 @@ impl Config {
             self.subscribe_mode,
             self.dedup_mode,
             self.multiple_event_handling,
+            self.coalesce_window_ms,
             self.ignore_self,
             self.context_message_limit,
             self.max_turns_per_session,
@@ -1572,6 +1594,7 @@ mod tests {
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
             multiple_event_handling: MultipleEventHandling::Queue,
+            coalesce_window_ms: DEFAULT_COALESCE_WINDOW_MS,
             ignore_self: true,
             kinds_override: None,
             channels_override: None,
@@ -2342,6 +2365,31 @@ channels = "ALL"
             "300",
         ]);
         assert_eq!(configured.idle_pool_sleep, 300);
+    }
+
+    #[test]
+    fn coalescing_window_has_safe_default_can_be_disabled_and_is_bounded() {
+        let key = "0".repeat(64);
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(default.coalesce_window_ms, DEFAULT_COALESCE_WINDOW_MS);
+
+        let disabled = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--coalesce-window-ms",
+            "0",
+        ]);
+        assert_eq!(disabled.coalesce_window_ms, 0);
+
+        assert!(CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--coalesce-window-ms",
+            "5001",
+        ])
+        .is_err());
     }
 
     #[test]

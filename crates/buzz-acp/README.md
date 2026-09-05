@@ -223,6 +223,39 @@ buzz-acp --agents 2 --heartbeat-interval 300 \
 |------|---------|---------|-------------|
 | `--multiple-event-handling` | `BUZZ_ACP_MULTIPLE_EVENT_HANDLING` | `steer` | What happens when a new eligible @mention arrives while a turn is already in-flight: `steer`, `queue`, `interrupt`, `owner-interrupt`. |
 | `--dedup` | `BUZZ_ACP_DEDUP` | `queue` | Must be `queue` for `steer`/`interrupt`/`owner-interrupt`. `drop` discards mid-turn events. |
+| `--coalesce-window-ms` | `BUZZ_ACP_COALESCE_WINDOW_MS` | `100` | Bounded pre-work collection window for an idle channel. Eligible events received during the window become one turn with every signed event ID preserved. `0` disables; maximum `5000`. Events arriving after work starts retain their own steering/queue envelope. |
+
+### Inbound classification and admission
+
+Every rule-matched channel event is classified before it can enter steering or
+the ordered queue. Signed recipient metadata is authoritative: `p` and
+`mention` tags naming this agent take precedence over readable `@Name` text.
+Textual names and NIP-27 `nostr:npub...` references are compatibility fallbacks
+only when an event has no recipient tags.
+
+| Class | Admission behavior |
+|-------|--------------------|
+| Owner command / stop / supersede | Admitted. Harness control commands (`!shutdown`, `!cancel`, `!rotate`) retain their existing immediate behavior; other owner work follows the configured steering/queue policy. |
+| Explicit peer task or question | Admitted only when this agent is explicitly directed and the content requests work or asks a question. |
+| Peer context / FYI | Does not start or steer a turn. It is retained in a bounded per-channel buffer and rendered as `[Passive context / FYI — no response requested]` with the next admitted turn. |
+| Ordinary thread reply with no work requested | Ignored silently. |
+| Self-authored / duplicate event ID | Ignored silently. Duplicate tracking uses bounded two-generation storage, so relay reconnect/replay cannot double-admit an event. |
+
+When intent is ambiguous, the classifier emits a warning and preserves the
+pre-classification rule-match behavior. This default-safe fallback prevents a
+directed request from disappearing merely because its phrasing is unfamiliar.
+Only events admitted by classification are evaluated by the agent-chain,
+ping-pong, and rate loop guards; FYI, ordinary, self-authored, duplicate, and
+guard-refused events stay silent with structured logs.
+
+For idle channels, the coalescing deadline starts with the first admitted
+event and is not extended by later arrivals. The main event loop has a deadline
+wake-up, so a lone event is dispatched when the window expires even if the
+relay stays quiet. Once a turn is active, coalescing is bypassed and the
+existing per-event steering/queue acknowledgement path remains in force. See
+the deterministic [three-agent quiet-terminal gate](tests/three_agent_quiet_terminal.rs)
+for crossed and simultaneous replies, owner follow-up, FYI attachment,
+explicit peer assignment, duplicates, and delayed delivery.
 
 **`steer` (default) — capability-aware true steering.** When the agent advertises
 `_meta.steering.supported: true` in its ACP `initialize` response, a second
