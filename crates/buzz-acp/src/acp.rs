@@ -187,18 +187,26 @@ pub struct AcpClient {
     /// `None` until the first `session_info_update` arrives, or after the
     /// run clears (goose/buzz-agent emit `activeRunId: null` at end of turn).
     /// Other agents may leave this unset — readers must treat `None` as
-    /// "no active run to steer into" and fall back to cancel+merge.
+    /// "no goose run to steer into" and rely on the advertised
+    /// `_meta.steering.supported` capability instead.
+    ///
+    /// This is only a protocol-mandated target for the goose steer method. Its
+    /// presence never enables steering; `_meta.steering.supported` remains the
+    /// sole capability signal.
     active_run_id: Option<String>,
     /// Whether the agent advertised `_meta.steering.supported: true` in its
     /// `initialize` response, meaning it implements the cross-adapter
     /// [`ACP_STEER_METHOD`] extension.
     ///
     /// Set once by [`initialize`](Self::initialize); `false` for agents that
-    /// omit the key. This is the **only** gate on writing an
-    /// [`ACP_STEER_METHOD`] request. It must never be replaced by error-code
-    /// probing: codex-acp answers unrecognized extension methods with `{}` —
-    /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
-    /// a delivered steer and drop the user's message from the queue.
+    /// omit the key. This is the **only** capability signal for the
+    /// cross-adapter transport, and it must never be inferred from the model
+    /// name, the adapter command, or the receipt of outbound
+    /// `session/update` notifications. It must never be replaced by
+    /// error-code probing: codex-acp answers unrecognized extension methods
+    /// with `{}` — a JSON-RPC *success*, not `-32601` — which the main loop
+    /// would read as a delivered steer and drop the user's message from the
+    /// queue.
     steering_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
@@ -1419,45 +1427,36 @@ impl AcpClient {
                     // value matches what goose's run-id check will compare
                     // against.
                     //
-                    // Transport precedence:
-                    //   Some(run_id)              → GOOSE_STEER_METHOD. goose
-                    //     wins whenever a run id exists: `expectedRunId` is
-                    //     strictly more precise about *which* run is steered.
-                    //   None + steering_supported → ACP_STEER_METHOD, the
-                    //     cross-adapter extension (claude-agent-acp,
-                    //     codex-acp), which takes no run id.
-                    //   None + !steering_supported → write nothing and ack
-                    //     `ExpectedRunIdMissing`; the main loop maps this to
-                    //     the universal cancel+merge `Steer` fallback.
-                    //
-                    // The capability flag is the ONLY gate on writing
-                    // ACP_STEER_METHOD. Probing an unknown method is unsafe:
+                    // `_meta.steering.supported` is the ONLY gate on writing
+                    // either steer method. A run id received later selects the
+                    // goose wire shape but never infers capability. Probing an
+                    // unknown method is unsafe:
                     // codex-acp answers unrecognized extension methods with
                     // `{}` — a JSON-RPC success — which would be read as a
                     // delivered steer and silently drop the user's message.
                     let prompt_block_refs: Vec<&str> =
                         req.prompt_blocks.iter().map(String::as_str).collect();
-                    let selected = match (&self.active_run_id, self.steering_supported) {
-                        (Some(run_id), _) => Some((
+                    let selected = match (self.steering_supported, &self.active_run_id) {
+                        (false, _) => None,
+                        (true, Some(run_id)) => Some((
                             SteerTransport::Goose,
                             GOOSE_STEER_METHOD,
                             build_goose_steer_params(session_id, run_id, &prompt_block_refs),
                         )),
-                        (None, true) => Some((
+                        (true, None) => Some((
                             SteerTransport::AcpExtension,
                             ACP_STEER_METHOD,
                             build_acp_steer_params(session_id, &prompt_block_refs),
                         )),
-                        (None, false) => None,
                     };
                     match selected {
                         None => {
                             tracing::warn!(
-                                "steer: no active_run_id and agent did not advertise \
-                                 {ACP_STEER_METHOD} — falling back to cancel+merge"
+                                "steer: agent did not advertise _meta.steering.supported — \
+                                 ordered-queue fallback (event waits for the current turn; no cancel)"
                             );
                             let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
-                                crate::pool::SteerError::ExpectedRunIdMissing,
+                                crate::pool::SteerError::CapabilityNotAdvertised,
                             ));
                         }
                         Some((transport, method, params)) => {
@@ -1670,7 +1669,7 @@ impl AcpClient {
                                                 tracing::warn!(
                                                     "steer rejected: {ACP_STEER_METHOD} returned \
                                                      unrecognized outcome {reported} — releasing \
-                                                     withheld event for cancel+merge"
+                                                     withheld event to the ordered queue"
                                                 );
                                                 crate::pool::SteerAck::Err(
                                                     crate::pool::SteerError::OutcomeRejected {
@@ -1820,8 +1819,8 @@ impl AcpClient {
                 // Both goose and buzz-agent emit `session_info_update` with
                 // `_meta.goose.activeRunId`: the id of the currently-active
                 // prompt run, or `null` when the run has cleared. Other agents
-                // don't emit this field; for them `active_run_id` stays `None`
-                // and steer callers will fall back to cancel+merge.
+                // don't emit this field; for them `active_run_id` stays `None`.
+                // This notification never changes `steering_supported`.
                 //
                 // Per the ACP `SessionInfoUpdate` schema, `_meta` is a field
                 // on the update object itself — nested inside `update`, not
@@ -3824,28 +3823,26 @@ mod tests {
         );
     }
 
-    // ── Goose-native steer arm tests ──────────────────────────────────────
+    // ── Capability-gated steer arm tests ──────────────────────────────────
     //
     // These exercise the seam between `install_steer_rx` and the read
     // loop's steer arm, isolated from `AgentPool` / `EventQueue` /
     // dispatch. They prove the locked Option-X contract at the read-loop
     // boundary:
-    //   1. With `active_run_id == None`, the steer arm acks
-    //      `Err(ExpectedRunIdMissing)` and writes nothing — the main
-    //      loop's "Err-before-pending" fallback path is reachable.
-    //   2. With `active_run_id` set, the steer arm writes the JSON-RPC
+    //   1. Without the initialize capability, the steer arm acks
+    //      `Err(CapabilityNotAdvertised)` and writes nothing.
+    //   2. With capability and `active_run_id` set, it writes the JSON-RPC
     //      request with the matching `expectedRunId` and routes the
     //      response to the ack oneshot as `Success`.
     //
     // We don't test the full mode-gate fork here — that lives in lib.rs
     // and is covered by goose e2e (Eva's lane).
 
-    /// Steer with no `active_run_id` set acks `ExpectedRunIdMissing`
-    /// without writing anything. The read loop continues normally and
+    /// Steer without the advertised capability writes nothing. The read loop continues normally and
     /// eventually hits the idle timeout (which is fine — we just need to
     /// observe the ack).
     #[tokio::test]
-    async fn native_steer_with_no_active_run_id_acks_expected_run_id_missing() {
+    async fn steer_without_capability_acks_capability_not_advertised() {
         // Quiet process: never emits anything, so the read loop has only
         // the steer arm and the idle timeout to consider.
         let mut client = spawn_script("sleep 10").await;
@@ -3888,14 +3885,13 @@ mod tests {
             "expected IdleTimeout once steer was acked + script stayed silent, got {read_result:?}"
         );
 
-        // Ack must be ExpectedRunIdMissing — the steer arm bailed out
-        // without writing because active_run_id was None at write time.
+        // Ack must identify the missing machine-readable capability.
         let ack = ack_rx
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::ExpectedRunIdMissing) => {}
-            other => panic!("expected SteerAck::Err(ExpectedRunIdMissing), got {other:?}"),
+            crate::pool::SteerAck::Err(crate::pool::SteerError::CapabilityNotAdvertised) => {}
+            other => panic!("expected SteerAck::Err(CapabilityNotAdvertised), got {other:?}"),
         }
     }
 
@@ -3918,6 +3914,7 @@ mod tests {
                       echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"end_turn\"}}'; \
                       sleep 10";
         let mut client = spawn_script(script).await;
+        set_steering_supported(&mut client);
 
         // Set active_run_id via a synthesized session_info_update so the
         // steer arm has a non-None value to read at write time.
@@ -3993,6 +3990,7 @@ mod tests {
                       sleep 1; \
                       echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
         let mut client = spawn_script(script).await;
+        set_steering_supported(&mut client);
 
         let update = session_info_update_msg(Some(serde_json::json!("run-99")));
         let _ = client.handle_session_update(&update);
@@ -4282,7 +4280,7 @@ mod tests {
     /// Buzz maps `SteerAck::Success` to `queue.remove_event`, so decoding
     /// `{}` as success would delete the user's message with no error, no
     /// fallback, and no log. An absent `outcome` must therefore be a
-    /// rejection, which releases the event and fires cancel+merge.
+    /// rejection, which releases the event to the ordered queue.
     #[tokio::test]
     async fn acp_steer_missing_outcome_acks_outcome_rejected_and_never_drops_event() {
         let capture = capture_path("outcome_absent");
@@ -4412,21 +4410,17 @@ mod tests {
         );
     }
 
-    /// Test 4 (companion to the existing
-    /// `native_steer_with_no_active_run_id_acks_expected_run_id_missing`):
-    /// no run id AND no advertised capability means nothing is written at
-    /// all. This is the gate that keeps a steer off the wire for adapters
-    /// that never implemented either method.
+    /// A run id notification is transport metadata, not capability evidence.
+    /// Even with a live run id, no advertised capability means no steer write.
     #[tokio::test]
-    async fn steer_writes_nothing_when_no_run_id_and_capability_absent() {
+    async fn run_id_notification_does_not_infer_steering_capability() {
         let capture = capture_path("no_transport");
         let mut client =
             spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
         assert!(!client.steering_supported(), "precondition: not advertised");
-        assert!(
-            client.active_run_id().is_none(),
-            "precondition: no active_run_id"
-        );
+        let update = session_info_update_msg(Some(serde_json::json!("run-without-capability")));
+        let _ = client.handle_session_update(&update);
+        assert_eq!(client.active_run_id(), Some("run-without-capability"));
 
         let (written, ack) = run_one_steer(&mut client, &capture).await;
 
@@ -4435,8 +4429,8 @@ mod tests {
             "no transport available must write nothing; wrote: {written:?}"
         );
         match ack {
-            crate::pool::SteerAck::Err(crate::pool::SteerError::ExpectedRunIdMissing) => {}
-            other => panic!("expected Err(ExpectedRunIdMissing), got {other:?}"),
+            crate::pool::SteerAck::Err(crate::pool::SteerError::CapabilityNotAdvertised) => {}
+            other => panic!("expected Err(CapabilityNotAdvertised), got {other:?}"),
         }
     }
 

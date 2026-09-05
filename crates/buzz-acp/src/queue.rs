@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::DedupMode;
+use crate::turn_state::{EventDisposition, EventIntent, TurnState, TurnStateMachine};
 
 /// Maximum events queued per channel before oldest events are dropped.
 const MAX_PENDING_PER_CHANNEL: usize = 500;
@@ -168,6 +169,12 @@ pub struct EventQueue {
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
     in_flight_deadline: Duration,
+    /// Per-session (per-channel) turn state machine — the single source of
+    /// truth for what happens to a second eligible event while a turn is
+    /// active. Kept here so the queue's existing lifecycle methods
+    /// (`flush_next`, `mark_complete`, the native-steer withhold/release
+    /// methods) drive the transitions at exactly the right points.
+    turn_states: TurnStateMachine,
 }
 
 impl EventQueue {
@@ -189,6 +196,7 @@ impl EventQueue {
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
+            turn_states: TurnStateMachine::new(),
         }
     }
 
@@ -237,6 +245,7 @@ impl EventQueue {
             );
             return false;
         }
+        self.turn_states.on_event_queued(event.channel_id);
         let queue = self.queues.entry(event.channel_id).or_default();
         // Enforce per-channel depth cap: drop oldest to make room.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
@@ -284,6 +293,9 @@ impl EventQueue {
             // now-hung prompt — nothing to recover), these events were never
             // delivered to the agent.
             self.recover_withheld_for_expired_channel(id);
+            // The turn never completed through `mark_complete`; reset the
+            // per-session turn state so the next dispatch starts clean.
+            self.turn_states.on_turn_completed(id);
         }
 
         // Find the channel whose head event has the oldest received_at,
@@ -358,7 +370,6 @@ impl EventQueue {
         self.in_flight_deadlines
             .insert(channel_id, now + self.in_flight_deadline);
         self.in_flight_batch_sizes.insert(channel_id, events.len());
-
         // Merge any cancelled events stored by requeue_as_cancelled().
         let cancelled_events = self
             .cancelled_batches
@@ -393,6 +404,9 @@ impl EventQueue {
         self.in_flight_channels.remove(&channel_id);
         self.in_flight_deadlines.remove(&channel_id);
         self.in_flight_batch_sizes.remove(&channel_id);
+        // The turn fully completed — the per-session state machine returns to
+        // the idle/queued state. The next dispatch transitions to Running.
+        self.turn_states.on_turn_completed(channel_id);
         let now = Instant::now();
         match self.retry_after.get(&channel_id) {
             // Active throttle → channel was requeued; keep retry_counts intact.
@@ -578,6 +592,7 @@ impl EventQueue {
             // goose-native steer events for the expired channel so they are
             // not permanently orphaned in the side table.
             self.recover_withheld_for_expired_channel(id);
+            self.turn_states.on_turn_completed(id);
         }
 
         self.queues.iter().any(|(id, q)| {
@@ -666,6 +681,9 @@ impl EventQueue {
         self.cancelled_batches.remove(&channel_id);
         self.cancel_reasons.remove(&channel_id);
         self.withheld_native_steer.remove(&channel_id);
+        // The agent is gone from this channel — settle the per-session turn
+        // state so stale steer/complete transitions cannot resurrect it.
+        self.turn_states.on_turn_completed(channel_id);
         // Preserve in_flight_channels AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
         // will expire (auto-cleaning the channel). Removing deadlines without
@@ -682,6 +700,50 @@ impl EventQueue {
     /// Whether any channel currently has a turn in flight.
     pub fn has_in_flight(&self) -> bool {
         !self.in_flight_channels.is_empty()
+    }
+
+    /// Mark a dispatched prompt as running on its actual ACP session.
+    ///
+    /// The capability value must come directly from the session's initialize
+    /// response. It is frozen for the turn so notifications cannot upgrade it.
+    pub fn mark_running(&mut self, channel_id: Uuid, steering_supported: bool) {
+        self.turn_states.on_dispatch(channel_id, steering_supported);
+    }
+
+    /// Atomically decide and claim the action for a second eligible event.
+    pub fn route_second_event(&self, channel_id: Uuid, intent: EventIntent) -> EventDisposition {
+        self.turn_states.on_event_arrived(channel_id, intent)
+    }
+
+    /// Current state for protocol integration tests and diagnostics.
+    pub fn turn_state(&self, channel_id: Uuid) -> Option<TurnState> {
+        self.turn_states.state(channel_id)
+    }
+
+    /// Record that an explicit cancel/supersede control signal was delivered
+    /// to the in-flight task for `channel`. See
+    /// [`TurnStateMachine::on_cancel_started`].
+    pub fn on_cancel_started(&mut self, channel_id: Uuid) {
+        self.turn_states.on_cancel_started(channel_id);
+    }
+
+    /// Restore the running state when an atomic cancellation claim could not
+    /// be delivered because the task completed first.
+    pub fn on_cancel_not_sent(&mut self, channel_id: Uuid) {
+        self.turn_states.on_cancel_not_sent(channel_id);
+    }
+
+    /// Restore the running state when a claimed steer could not be sent or
+    /// withheld. Successful and failed ACP acknowledgements resolve through
+    /// `remove_event` and `release_native_steer` respectively.
+    pub fn on_steer_not_sent(&mut self, channel_id: Uuid) {
+        self.turn_states.on_steer_resolved(channel_id);
+    }
+
+    /// Record that a completed turn for `channel` is publishing / being
+    /// acknowledged. See [`TurnStateMachine::on_publishing`].
+    pub fn on_publishing(&mut self, channel_id: Uuid) {
+        self.turn_states.on_publishing(channel_id);
     }
 
     // ── Goose-native steer withhold (side table) ──────────────────────────
@@ -704,10 +766,9 @@ impl EventQueue {
     /// event id was not present in `queues[channel_id]` (race-safe no-op:
     /// the event may have already been drained, removed, or never queued).
     ///
-    /// Must be called synchronously from the mode-gate fork immediately
-    /// after `pool.send_steer` returns `Ok(())` and before any watcher task
-    /// is spawned, so the withhold is established before `mark_complete` /
-    /// any subsequent `flush_next` tick can run.
+    /// Must be called synchronously before `pool.send_steer`: a steer is never
+    /// put on the wire unless its event is already withheld, making duplicate
+    /// delivery impossible even if the prompt finishes immediately afterward.
     pub fn mark_native_steer_pending(&mut self, channel_id: Uuid, event_id: &str) -> bool {
         let Some(q) = self.queues.get_mut(&channel_id) else {
             return false;
@@ -752,6 +813,9 @@ impl EventQueue {
         if entries.is_empty() {
             self.withheld_native_steer.remove(&channel_id);
         }
+        // The steer was attempted (and possibly failed): the active turn
+        // continues, so the session state machine returns to Running.
+        self.turn_states.on_steer_resolved(channel_id);
         // Push to FRONT so original `received_at` keeps the event at the head
         // of the channel's queue. Per-channel cap is enforced below in case
         // a flood of events arrived during the ack window.
@@ -774,6 +838,9 @@ impl EventQueue {
     /// event has been "delivered" via the non-cancelling path and must not
     /// be redelivered via normal dispatch. Idempotent across both stores.
     pub fn remove_event(&mut self, channel_id: Uuid, event_id: &str) {
+        // The steer succeeded — the event was delivered via the non-cancelling
+        // path and the active turn continues.
+        self.turn_states.on_steer_resolved(channel_id);
         if let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) {
             entries.retain(|qe| qe.event.id.to_hex() != event_id);
             if entries.is_empty() {
@@ -805,6 +872,9 @@ impl EventQueue {
         let Some(entries) = self.withheld_native_steer.remove(&channel_id) else {
             return;
         };
+        // The in-flight turn is gone (expired); a steer resolution transition
+        // to Running would be wrong — the caller transitions to Queued via
+        // `on_turn_completed` on the same expiry path.
         let n = entries.len();
         let queue = self.queues.entry(channel_id).or_default();
         for qe in entries.into_iter().rev() {
@@ -1740,8 +1810,8 @@ impl MergeFraming {
     }
 }
 
-/// Framing strings for the goose-native steer path (lib.rs mode-gate),
-/// pulled from the same source-of-truth as the cancel+merge fallback
+/// Framing strings for the true steer path (lib.rs mode-gate), pulled from the
+/// same source-of-truth as the retained legacy merged-steer framing
 /// (`MergeFraming::for_reason(Some(CancelReason::Steer))`).
 ///
 /// Returns `(new_header_single, closing_note)`. Native-steer renders only
@@ -1749,8 +1819,7 @@ impl MergeFraming {
 /// no `prior_header`, no original-request section, because the in-flight
 /// goose turn already has all of that in context. The two paths share
 /// these strings so an agent receiving either transport gets the same
-/// "weave it in, don't abandon your work" orientation (Eva's drift-proof
-/// requirement: native and fallback must not diverge in UX).
+/// "weave it in, don't abandon your work" orientation.
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
     (framing.new_header_single, framing.closing_note)
