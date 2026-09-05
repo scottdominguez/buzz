@@ -66,12 +66,19 @@ pub enum MultipleEventHandling {
     /// Queue new events while a turn is in-flight. Deliver after current turn
     /// completes. Existing behavior — zero code change in this path.
     Queue,
-    /// Cancel the in-flight turn and re-dispatch a merged prompt that frames
-    /// the new events as a **steering message** — one that arrived while the
-    /// agent was working, to be woven into the in-progress task rather than
-    /// treated as a replacement. Fires for any author the inbound author gate
-    /// admits (owner ∪ allowlist ∪ siblings). This is the default mid-turn
-    /// delivery path. Requires DedupMode::Queue.
+    /// Capability-aware **true** steering (default). When the agent advertises
+    /// `_meta.steering.supported` in its `initialize` response, a new eligible
+    /// event is injected into the active ACP turn via a non-cancelling steer
+    /// request (`_session/steering` / `_goose/unstable/session/steer`) — the
+    /// original prompt stays alive and incorporates the new text. When the
+    /// agent does NOT advertise the capability, the event enters the ordered
+    /// queue and is delivered after the current turn completes. **Never a
+    /// cancel-and-re-prompt.**
+    ///
+    /// Cancellation is reserved for explicit owner stop/supersede policy
+    /// (`Interrupt`, `!cancel`, `!rotate`). Fires for any author the inbound
+    /// author gate admits (owner ∪ allowlist ∪ siblings). Requires
+    /// `DedupMode::Queue`.
     Steer,
     /// Cancel the in-flight turn and re-dispatch a merged prompt combining
     /// the original events with the new ones, framed as a **supersede** (the
@@ -356,8 +363,10 @@ pub struct CliArgs {
     pub dedup: DedupMode,
 
     /// How to handle new @mentions while a turn is already in-flight.
-    /// steer (default): cancel+re-prompt, framing the new mention as a message
-    /// that arrived mid-task — the agent keeps working and weaves it in.
+    /// steer (default): capability-aware true steering — inject the new mention
+    /// into the live turn via a non-cancelling steer when the agent advertises
+    /// `_meta.steering.supported`; otherwise the event waits in the ordered
+    /// queue until the turn completes. Never cancel+re-prompt.
     /// queue: events wait until the current turn completes.
     /// interrupt: cancel+re-prompt framed as a supersede (new replaces old).
     /// owner-interrupt: interrupt only for the agent owner's mentions.
@@ -693,25 +702,27 @@ fn validate_allowlist(entries: &[String]) -> Result<HashSet<String>, ConfigError
 
 /// Validate the `--multiple-event-handling` / `--dedup` combination.
 ///
-/// Every mid-turn cancel mode (`Steer`, `Interrupt`, `OwnerInterrupt`) requires
-/// `DedupMode::Queue`: `DedupMode::Drop` discards events during the cancel drain
-/// window, which would produce incomplete merged prompts. `Queue` handling
-/// imposes no constraint.
+/// Every mid-turn mode that needs the event to survive arrival during a
+/// live turn (`Steer`, `Interrupt`, `OwnerInterrupt`) requires
+/// `DedupMode::Queue`: `DedupMode::Drop` discards events while a turn is
+/// in-flight, which would silently lose the very messages `Steer`/`Interrupt`
+/// exist to deliver (for `Steer`, the steer-injection path; for `Interrupt`,
+/// the merged supersede re-prompt). `Queue` handling imposes no constraint.
 fn validate_multiple_event_handling(
     handling: MultipleEventHandling,
     dedup: DedupMode,
 ) -> Result<(), ConfigError> {
-    let is_cancel_mode = matches!(
+    let requires_queue = matches!(
         handling,
         MultipleEventHandling::Steer
             | MultipleEventHandling::Interrupt
             | MultipleEventHandling::OwnerInterrupt
     );
-    if is_cancel_mode && matches!(dedup, DedupMode::Drop) {
+    if requires_queue && matches!(dedup, DedupMode::Drop) {
         return Err(ConfigError::ConfigFile(
             "--multiple-event-handling=steer (or interrupt/owner-interrupt) requires \
-             --dedup=queue. DedupMode::Drop discards events during the cancel drain window, \
-             producing incomplete merged prompts."
+             --dedup=queue. DedupMode::Drop discards events while a turn is in-flight, \
+             silently losing the mid-turn messages these modes exist to deliver."
                 .into(),
         ));
     }
@@ -1182,7 +1193,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} multiple_event_handling={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,

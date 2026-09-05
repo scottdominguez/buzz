@@ -68,10 +68,9 @@ pub struct TaskMeta {
     pub control_tx: Option<tokio::sync::oneshot::Sender<ControlSignal>>,
     /// Steer request channel for non-cancelling mid-turn delivery.
     /// Capacity-1; `try_send` from the main loop fails on `Full`/`Closed`,
-    /// in which case the caller must fall back to the universal
-    /// `ControlSignal::Steer` cancel+merge path. `None` for heartbeat
-    /// tasks only — all prompt tasks install a steer channel regardless
-    /// of the agent's name.
+    /// in which case the event stays in the ordered queue (delivered after
+    /// the current turn — no cancel). `None` for heartbeat tasks only — all
+    /// prompt tasks install a steer channel regardless of the agent's name.
     pub steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
     /// Successful non-cancelling steers acknowledged while this task owned the
     /// live session. The session ID prevents a late ack from contaminating a
@@ -352,8 +351,13 @@ pub enum ControlSignal {
     /// Stop the current turn and requeue its triggering batch for a merged
     /// re-prompt framed as a **steer**: a message arrived while the agent was
     /// working; it should continue its work and incorporate the message if
-    /// relevant, not treat it as a replacement task. This is the default
-    /// mid-turn delivery path (see [`MultipleEventHandling::Steer`]).
+    /// relevant, not treat it as a replacement task.
+    ///
+    /// **Legacy routing note:** the main loop no longer sends this signal for
+    /// a second eligible event. `MultipleEventHandling::Steer` now attempts a
+    /// non-cancelling steer into the live turn and falls back to the ordered
+    /// queue (no cancel) when the agent lacks the capability. This variant is
+    /// retained only for the pool's legacy merged-prompt machinery and tests.
     Steer,
     /// Stop the current turn and drop its triggering batch. The session is
     /// invalidated just like cancel; the next turn creates a fresh session.
@@ -398,22 +402,17 @@ pub enum ControlSignal {
 /// (`session_prompt_blocks_with_idle_timeout`), so no plumbing is required
 /// for that — only a function parameter pass-through.
 ///
-/// If `active_run_id` is `None` at write time (no `session/update` seen yet
-/// — e.g. agents that never emit run-id metadata), the goose-native method
-/// cannot form a valid `expectedRunId`, and the read loop falls back to the
-/// cross-adapter `_session/steering` method when the agent advertised
-/// `_meta.steering.supported` at `initialize`. That method takes no run id, so
-/// no freshness concern applies to it. When neither transport is available the
-/// read loop acks [`SteerError::ExpectedRunIdMissing`]. The main loop maps that
-/// to the "Err-before-pending" bucket: no withhold/mark was established at
-/// `pool::send_steer` time because the request was rejected before any
-/// write, so the watcher only needs to release nothing and fall back to the
-/// universal `ControlSignal::Steer` cancel+merge path.
+/// `_meta.steering.supported` must be true before either transport is used.
+/// Once enabled, a live run id selects the goose-native method; without one,
+/// the read loop uses `_session/steering`. The run id is transport data, never
+/// capability evidence. When capability was not advertised, the read loop
+/// acks [`SteerError::CapabilityNotAdvertised`] without writing anything and
+/// the event returns to the ordered queue.
 pub struct SteerRequest {
     /// Prompt body text blocks. Each entry becomes one `text` content
     /// block in `params.prompt`. Built by the main loop via
     /// `queue::native_steer_framing()` + `queue::format_event_block` so
-    /// the wording cannot drift from the cancel+merge fallback path.
+    /// the wording cannot drift from the retained merged-steer framing.
     pub prompt_blocks: Vec<String>,
     /// Oneshot for the read loop to report the outcome.
     pub ack_tx: tokio::sync::oneshot::Sender<SteerAck>,
@@ -431,28 +430,18 @@ pub struct SteerRequest {
 pub enum SteerError {
     /// The agent returned a JSON-RPC error response to the steer request.
     ///
-    /// `code` is the JSON-RPC error code:
-    /// - `-32601` (`method_not_found`): the agent does not implement the
-    ///   steer extension. The main loop should fire the cancel+merge
-    ///   fallback so the message still reaches the agent.
-    /// - Any other code: the write landed and the agent rejected it at the
-    ///   application level (e.g. wrong run id). Release the withheld event
-    ///   for normal dispatch; do NOT fire the fallback — the turn is still
-    ///   running or just ended.
+    /// Any error, including `-32601` (`method_not_found`), releases the event
+    /// to ordered delivery after the current turn. Automatic cancellation is
+    /// never used as a steering fallback.
     AgentError { code: i64, message: String },
     /// Transport-level failure: write error, read EOF, JSON-RPC framing
     /// violation, etc. The string carries the underlying `AcpError`'s display.
     Transport(String),
-    /// At steer-write time neither steer transport was available: no
-    /// `expectedRunId` (`AcpClient::active_run_id` was `None`, so the
-    /// goose-native method could not be formed) and the agent did not
-    /// advertise the cross-adapter `_session/steering` extension. The read
-    /// loop drops the request without writing anything; the main loop should
-    /// release any withheld event and fall back to the universal cancel+merge
-    /// `ControlSignal::Steer` path. This is in the same "Err-before-pending"
-    /// bucket as `Transport` write failures: no in-process state was
-    /// established, so no in-process cleanup is needed.
-    ExpectedRunIdMissing,
+    /// The initialize response did not advertise
+    /// `_meta.steering.supported: true`. The read loop writes nothing even if
+    /// a later notification supplied a goose run id. The main loop restores
+    /// the withheld event to the ordered queue and never cancels the turn.
+    CapabilityNotAdvertised,
     /// A `_session/steering` request returned a JSON-RPC *success* whose
     /// `outcome` was not one of the two recognized delivery outcomes
     /// (`injected`, `startedNewTurn`) — including `failed` (codex-acp) and a
@@ -460,10 +449,10 @@ pub enum SteerError {
     /// reported, for logs.
     ///
     /// The steer did NOT land, so the main loop must release the withheld
-    /// event and fire the cancel+merge fallback — exactly like a write that
-    /// never happened. Treating an unrecognized success as delivery would
-    /// drop the user's message: codex-acp answers unrecognized extension
-    /// methods with a bare `{}` success rather than `-32601`.
+    /// event back to the ordered queue; it is delivered after the current
+    /// turn completes. Never a cancel. Treating an unrecognized success as
+    /// delivery would drop the user's message: codex-acp answers unrecognized
+    /// extension methods with a bare `{}` success rather than `-32601`.
     OutcomeRejected { outcome: String },
     /// The read loop never got to dispatch the steer because the prompt
     /// completed first. Delivery state for the underlying message is
@@ -487,14 +476,17 @@ pub enum SteerAck {
     Success { session_id: String },
     /// The steer was attempted but failed. Delivery state for the
     /// underlying message is unknown after prompt completion; the main
-    /// loop must release the withheld event and fall back to the
-    /// universal `Steer` cancel+merge path so the message still reaches
-    /// the agent.
+    /// loop must release the withheld event back to the ordered queue and
+    /// let it be delivered after the current turn. The payload is
+    /// `Debug`-only (read by the `?ack` tracing line in the main loop's
+    /// `PoolEvent::SteerAck` arm) — the dead-code lint can't see that
+    /// path, hence the `#[allow]`.
+    #[allow(dead_code)]
     Err(SteerError),
     /// The prompt completed before the read loop selected the steer arm.
     /// Treated as a benign no-op: release the withheld event for normal
-    /// dispatch. Do not fire the fallback `Steer` signal — there is no
-    /// in-flight turn to signal, and normal dispatch handles delivery.
+    /// dispatch. No fallback signal — there is no in-flight turn to
+    /// signal, and normal dispatch handles delivery.
     PromptCompletedNeutral,
 }
 
@@ -529,8 +521,8 @@ pub enum PromptOutcome {
     /// Agent is healthy — no respawn, no retry penalty.
     Cancelled,
     /// The agent did not stop within `grace` after `session/cancel` was sent
-    /// for a control-signal cancellation (steer fallback, interrupt, or
-    /// explicit stop). Distinct from [`TimeoutKind::Hard`]: this is a bounded
+    /// for an explicit interrupt/stop (or the retained legacy internal Steer
+    /// control variant). Distinct from [`TimeoutKind::Hard`]: this is a bounded
     /// cleanup deadline, not the turn's configured max-turn wall clock, so it
     /// must never be reported or dead-lettered as a hard-cap breach. The
     /// agent process is uncertain — treated as poisoned and respawned, same
@@ -828,9 +820,9 @@ impl AgentPool {
     /// Returns `Ok(())` if the request was accepted by the read loop's
     /// receiver (capacity-1 mpsc; one slot is the single in-flight steer
     /// write). Returns `Err(SteerError::Transport(_))` on `Full`/`Closed`
-    /// (already-in-flight write, or read loop torn down). Callers must
-    /// fall back to the universal `ControlSignal::Steer` cancel+merge path
-    /// on `Err`.
+    /// (already-in-flight write, or read loop torn down). Callers must leave
+    /// the event in the ordered queue — it is delivered after the current
+    /// turn completes. No cancel is ever issued from this path.
     ///
     /// This does **not** spawn the ack watcher — the caller owns the
     /// oneshot `ack_tx` inside `SteerRequest` and is responsible for
@@ -1027,8 +1019,8 @@ const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounded grace window for the post-cancel drain after a control-signal
-/// cancellation (steer fallback, interrupt, or explicit stop). This is a
+/// Bounded grace window for the post-cancel drain after an explicit interrupt,
+/// stop, or retained legacy internal Steer control. This is a
 /// cleanup deadline, not the turn's configured max-turn wall clock — see
 /// [`AcpClient::cancel_with_cleanup_grace`] and
 /// [`classify_control_cancel_failure`].

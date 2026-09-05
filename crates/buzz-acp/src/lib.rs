@@ -10,9 +10,30 @@ mod pool_lifecycle;
 mod queue;
 mod relay;
 mod setup_mode;
+mod turn_state;
 mod usage;
 
 pub use usage::TurnUsage;
+
+/// Public surface for integration tests in `crates/buzz-acp/tests/` that drive
+/// the pool/queue/ACP machinery directly against a fake agent subprocess.
+///
+/// These mirror the crate-internal modules' existing `pub` items; the module
+/// keeps them out of the crate root so they cannot collide with the crate's
+/// own `use` imports.
+#[doc(hidden)]
+pub mod test_api {
+    pub use crate::acp::AcpClient;
+    pub use crate::config::{DedupMode, PermissionMode};
+    pub use crate::pool::{
+        run_prompt_task, AgentPool, ChannelInfoResolver, ControlSignal, MemberResolver, OwnedAgent,
+        PromptContext, PromptOutcome, PromptResult, SessionState, SteerAck, SteerError,
+        SteerRequest, TaskMeta,
+    };
+    pub use crate::queue::{BatchEvent, EventQueue, FlushBatch, QueuedEvent};
+    pub use crate::relay::{ChannelInfo, RestClient};
+    pub use crate::turn_state::{EventDisposition, EventIntent, TurnState, TurnStateMachine};
+}
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -2583,10 +2604,10 @@ async fn tokio_main() -> Result<()> {
                     Some(PoolEvent::Panic(e))
                 }
                 // Goose-native steer ack from a watcher task. Outcomes drive
-                // queue side-effects (drop / release withheld event) and
-                // optionally the cancel+merge fallback signal. See the
-                // `Some(PoolEvent::SteerAck(...))` match arm below for the
-                // locked semantics (Eva + Max + Perci).
+                // queue side-effects (drop / release withheld event); a
+                // released event is delivered by the ordered queue — never a
+                // cancel. See the `Some(PoolEvent::SteerAck(...))` match arm
+                // below for the locked semantics.
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
                 }
@@ -2833,7 +2854,9 @@ async fn tokio_main() -> Result<()> {
                                             buzz_event.channel_id,
                                             ControlSignal::Cancel,
                                         );
-                                        if !fired {
+                                        if fired {
+                                            queue.on_cancel_started(buzz_event.channel_id);
+                                        } else {
                                             tracing::warn!(
                                                 channel_id = %buzz_event.channel_id,
                                                 "!cancel received but no in-flight task — no-op"
@@ -2872,6 +2895,7 @@ async fn tokio_main() -> Result<()> {
                                             ControlSignal::Rotate,
                                         );
                                         if fired {
+                                            queue.on_cancel_started(buzz_event.channel_id);
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
                                                 "!rotate received — cancelling in-flight turn and rotating session"
@@ -2973,9 +2997,9 @@ async fn tokio_main() -> Result<()> {
                                     pool::reaction_add(&rc, &eid, "👀").await;
                                 });
                             }
-                            // Event is already queued. If mode requires it AND
-                            // the channel has an in-flight task, fire cancel —
-                            // OR take the non-cancelling (ACP steer) fork for Steer signals.
+                            // Event is already queued. For an in-flight channel,
+                            // let the per-session state machine choose true
+                            // steering, explicit interruption, or FIFO waiting.
                             if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
                                 // Author eligibility (owner ∪ allowlist ∪
                                 // siblings, or channel members under
@@ -2988,33 +3012,52 @@ async fn tokio_main() -> Result<()> {
                                     &author_hex,
                                     owner_cache.get(),
                                 );
-                                if let Some(signal) = signal {
-                                    // Non-cancelling fork: when the mode
-                                    // wants a Steer, attempt the
-                                    // non-cancelling path first. On accept,
-                                    // withhold the queued event and spawn an
-                                    // ack watcher; the main loop's
-                                    // `PoolEvent::SteerAck` arm decides
-                                    // success/release/fallback. On reject
-                                    // (including agents that advertise no
-                                    // steer transport at all), fall through
-                                    // to the universal cancel+merge `Steer`
-                                    // signal so the event still reaches the
-                                    // agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
-                                        && try_native_steer(
+                                let intent = match signal {
+                                    Some(ControlSignal::Steer) => {
+                                        crate::turn_state::EventIntent::Steer
+                                    }
+                                    Some(ControlSignal::Interrupt) => {
+                                        crate::turn_state::EventIntent::Cancel
+                                    }
+                                    _ => crate::turn_state::EventIntent::Queue,
+                                };
+                                // The per-session state machine atomically
+                                // claims the only legal action. In particular,
+                                // `Steer` is returned only for a Running turn
+                                // whose initialize response advertised
+                                // `_meta.steering.supported: true`.
+                                match queue.route_second_event(buzz_event.channel_id, intent) {
+                                    crate::turn_state::EventDisposition::Steer => {
+                                        if !try_native_steer(
                                             &mut pool,
                                             &mut queue,
                                             buzz_event.channel_id,
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
-                                        );
-                                    if !native_attempted {
-                                        signal_in_flight_task(
+                                        ) {
+                                            tracing::debug!(
+                                                channel_id = %buzz_event.channel_id,
+                                                event_id = %event_id_hex,
+                                                "steer could not be sent — ordered-queue fallback (no cancel)"
+                                            );
+                                        }
+                                    }
+                                    crate::turn_state::EventDisposition::Cancel => {
+                                        let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
-                                            signal,
+                                            ControlSignal::Interrupt,
+                                        );
+                                        if !fired {
+                                            queue.on_cancel_not_sent(buzz_event.channel_id);
+                                        }
+                                    }
+                                    crate::turn_state::EventDisposition::Queue => {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            event_id = %event_id_hex,
+                                            "second event remains in ordered queue"
                                         );
                                     }
                                 }
@@ -3257,7 +3300,6 @@ async fn tokio_main() -> Result<()> {
             })) => {
                 // Mid-turn steer attempt resolved (either transport:
                 // `_goose/unstable/session/steer` or `_session/steering`).
-                // Locked semantics (Eva + Max + Perci, unanimous on Option X):
                 //
                 //   Success
                 //     The agent received the steer via the non-cancelling
@@ -3275,130 +3317,74 @@ async fn tokio_main() -> Result<()> {
                 //     the agent really is running more work, so the
                 //     channel's in-flight budget should reflect it.
                 //
-                //   Err(_) where the write never landed (Transport /
-                //   ExpectedRunIdMissing):
-                //     Delivery state of the underlying message is "never
-                //     attempted on the wire". Release withheld back to the
-                //     queue front AND issue the cancel+merge fallback so
-                //     the message still reaches the agent.
-                //
-                //   Err(OutcomeRejected { .. })
-                //     A `_session/steering` request returned a JSON-RPC
-                //     success whose `outcome` was not `injected` or
-                //     `startedNewTurn` (codex's `failed`, an unknown value,
-                //     or a bare `{}` with no `outcome` at all). The steer
-                //     did not land, so this is treated exactly like a write
-                //     that never happened: release withheld AND fire the
-                //     cancel+merge fallback. Handled by the catch-all
-                //     `Err(_)` arm below.
-                //
-                //   Err(AgentError { code: -32601, .. })
-                //     The agent returned method_not_found — it does not
-                //     implement the steer extension. Release withheld AND
-                //     fire the cancel+merge fallback so the message still
-                //     reaches the agent via the universal path.
-                //
-                //   Err(AgentError { code: other, .. })
-                //     The write landed and the agent returned a JSON-RPC
-                //     error at the application level (e.g. wrong run id).
-                //     The agent's turn is still running (or just completed).
-                //     Release withheld for normal dispatch; do NOT fire the
-                //     fallback signal — the agent already saw the steer
-                //     attempt. If the turn is still running, normal dispatch
-                //     re-delivers when it completes. If the turn already
-                //     ended, there is nothing to cancel.
-                //
-                //   PromptCompletedNeutral
-                //     The read loop wrote the steer (or was preparing to)
-                //     but the prompt completed before the response landed.
-                //     Delivery state is unknown — but the prompt completing
-                //     means there is no in-flight turn to signal anymore.
-                //     Release withheld for normal dispatch; do NOT fire
-                //     the fallback signal (it would target a turn that
-                //     just ended; normal dispatch already handles
-                //     redelivery via the released queue entry).
+                //   Everything else (Err, PromptCompletedNeutral, watcher drop)
+                //     The steer did not deliver the event: either the agent
+                //     advertises no steer transport at all
+                //     (`CapabilityNotAdvertised`), the write never landed
+                //     (`Transport`), the agent rejected it (`AgentError`),
+                //     the outcome was unrecognized (`OutcomeRejected`), or
+                //     the prompt completed before the response landed
+                //     (`PromptCompletedNeutral`). In every case the withheld
+                //     event is released back to the ordered queue and
+                //     delivered after the current turn — or by the next
+                //     dispatch if the turn already ended. NEVER a
+                //     cancel-and-re-prompt: cancellation is reserved for
+                //     explicit owner stop/supersede policy (Interrupt,
+                //     !cancel, !rotate), never for an automatic mid-turn
+                //     fallback.
                 //
                 //   Err(PromptCompleted)
-                //     `SteerError::PromptCompleted` is returned synchronously
-                //     by `pool::send_steer` when no task is in flight (handled
-                //     in `try_native_steer`'s Err branch, which falls through
-                //     to cancel+merge). It is never routed through the ack
-                //     channel, so this variant never appears in `SteerAckEvent`.
-                //
-                //   Watcher Err (oneshot dropped)
-                //     Should not happen — the read loop drains
-                //     pending_steer on every return path. If it does,
-                //     treat as PromptCompletedNeutral to avoid leaking
-                //     the withheld event in `withheld_native_steer`.
-                let (release_withheld, drop_withheld, signal_fallback) = match &ack {
-                    Ok(pool::SteerAck::Success { .. }) => (false, true, false),
-                    // -32601 = method_not_found: agent does not implement the
-                    // steer extension. Fire cancel+merge so the message still
-                    // reaches the agent.
-                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { code, .. }))
-                        if *code == -32601 =>
-                    {
-                        (true, false, true)
+                //     Returned synchronously by `pool::send_steer` when no
+                //     task is in flight (handled in `try_native_steer`'s Err
+                //     branch, which leaves the event queued). Never routed
+                //     through the ack channel, so this variant never appears
+                //     in `SteerAckEvent`.
+                let delivery_recorded = if let Ok(pool::SteerAck::Success { session_id }) = &ack {
+                    queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
+                    let recorded = pool.record_successful_steer(
+                        channel_id,
+                        event_id.clone(),
+                        session_id.clone(),
+                    );
+                    if !recorded {
+                        tracing::warn!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            "successful steer could not be associated with its live session — \
+                             restoring event for ordered delivery"
+                        );
                     }
-                    // AgentError: write landed, agent rejected it at the
-                    // application level (e.g. wrong run id). Release for
-                    // normal dispatch; no fallback signal (the turn is still
-                    // running or just ended — either way there is nothing to
-                    // cancel).
-                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
-                        (true, false, false)
-                    }
-                    // Transport / ExpectedRunIdMissing / OutcomeRejected: the
-                    // steer did not land. Release and fire the cancel+merge
-                    // fallback so the message still reaches the agent.
-                    Ok(pool::SteerAck::Err(_)) => (true, false, true),
-                    Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
-                    Err(_recv_err) => (true, false, false),
+                    recorded
+                } else {
+                    false
                 };
+                // A wire success is retired only after its event id is durably
+                // associated with the exact live ACP session. If the process
+                // died or the session rotated before the ack was handled, put
+                // the event back in FIFO rather than silently losing it.
+                let drop_withheld = delivery_recorded;
+                let release_withheld = !delivery_recorded;
                 tracing::info!(
                     channel = %channel_id,
                     event_id = %event_id,
                     ?ack,
+                    delivery_recorded,
                     release_withheld,
                     drop_withheld,
-                    signal_fallback,
                     "non-cancelling steer ack received"
                 );
-                if let Ok(pool::SteerAck::Success { session_id }) = &ack {
-                    queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
-                    if !pool.record_successful_steer(
-                        channel_id,
-                        event_id.clone(),
-                        session_id.clone(),
-                    ) {
-                        tracing::warn!(
-                            channel = %channel_id,
-                            event_id = %event_id,
-                            "successful steer lost its in-flight delivery ledger"
-                        );
-                    }
-                }
                 if drop_withheld {
                     queue.remove_event(channel_id, &event_id);
                 }
                 if release_withheld {
                     queue.release_native_steer(channel_id, &event_id);
                 }
-                if signal_fallback {
-                    // Universal cancel+merge fallback. Note: the
-                    // queued event has already been released to the
-                    // front of `queues[channel_id]`, so the cancel
-                    // will pick it up as part of the merged batch and
-                    // re-prompt the agent.
-                    signal_in_flight_task(&mut pool, channel_id, ControlSignal::Steer);
-                }
-                // After releasing a withheld event, give dispatch a chance
-                // to re-flush. If the prompt is still in flight, the
-                // channel stays `in_flight_channels` and `flush_next`
-                // skips it — but a Steer fallback signal sent above will
-                // tear down the in-flight task; on its completion the
-                // queue drains. We still try here in case the in-flight
-                // task has already returned.
+                // After releasing a withheld event, give dispatch a chance to
+                // re-flush. If the prompt is still in flight the channel stays
+                // in `in_flight_channels` and `flush_next` skips it — the
+                // event waits in the ordered queue until the turn completes.
+                // If the in-flight task has already returned, the released
+                // event is dispatched here.
                 for (channel_id, thread_tags) in
                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                 {
@@ -3656,22 +3642,24 @@ fn signal_in_flight_task(
 ///   there so [`EventQueue::mark_native_steer_pending`] can move it to the
 ///   side table.
 /// - `multiple_event_handling` resolved to `ControlSignal::Steer`; this
-///   function is the non-cancelling fork of that signal.
+///   function is the non-cancelling fork of that signal. The caller must have
+///   atomically claimed [`EventDisposition::Steer`](crate::turn_state::EventDisposition)
+///   from [`EventQueue::route_second_event`] first.
 ///
 /// Returns `true` if the native attempt was accepted by the read loop
 /// (capacity-1 mpsc `try_send` succeeded, event withheld synchronously,
-/// ack watcher spawned). On `true` the caller MUST NOT issue the
-/// universal cancel+merge `ControlSignal::Steer` fallback — the watcher
-/// will issue it from the ack arm if the native attempt fails.
+/// ack watcher spawned). On `true` the caller MUST NOT issue any control
+/// signal — the watcher will resolve the event via `PoolEvent::SteerAck`.
 ///
 /// Returns `false` if `pool.send_steer` failed (no in-flight task,
 /// `steer_tx` already full from a prior in-flight steer, or read loop
-/// torn down). The caller MUST fall through to
-/// `signal_in_flight_task(channel_id, ControlSignal::Steer)` so the
-/// event still reaches the agent via the universal path.
+/// torn down). The event is already in the ordered queue, so the caller
+/// leaves it there: it is delivered after the current turn completes.
+/// NO cancel signal is issued — cancellation is reserved for explicit
+/// owner stop/supersede policy.
 ///
-/// The withheld event is NOT released here on `false` because no withhold
-/// was established: `mark_native_steer_pending` only runs on `Ok(())`.
+/// The event is withheld before the request is sent. Every `false` path restores
+/// it synchronously and resolves the `Steering` claim back to `Running`.
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -3682,8 +3670,8 @@ fn try_native_steer(
 ) -> bool {
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
-    // native and cancel+merge fallback share these so the agent gets the
-    // same orientation regardless of transport). The single event block
+    // native and legacy merged framing share these so the agent gets stable
+    // orientation). The single event block
     // is rendered by `queue::format_event_block`, the same function
     // `queue::format_prompt` uses internally for `[Buzz event: …]`
     // sections, so the rendering also cannot drift.
@@ -3709,29 +3697,21 @@ fn try_native_steer(
         ack_tx,
     };
 
+    // Withhold BEFORE giving the request to the read loop. Once the sender
+    // accepts it the write may happen immediately, so doing this afterward
+    // leaves a duplicate-delivery window if the prompt result wins the race.
+    if !queue.mark_native_steer_pending(channel_id, &event_id_hex) {
+        queue.on_steer_not_sent(channel_id);
+        tracing::warn!(
+            channel = %channel_id,
+            event_id = %event_id_hex,
+            "steer claim had no matching queued event — request not sent"
+        );
+        return false;
+    }
+
     match pool.send_steer(channel_id, request) {
         Ok(()) => {
-            // Withhold the queued event synchronously BEFORE spawning
-            // the watcher: this closes the race where `mark_complete`
-            // clears `in_flight_channels` and a stray `flush_next` could
-            // re-deliver the event via normal dispatch. See
-            // `EventQueue::mark_native_steer_pending` docs at queue.rs:606.
-            let withheld = queue.mark_native_steer_pending(channel_id, &event_id_hex);
-            if !withheld {
-                // Race: the event was already drained out of the queue
-                // before we got here (e.g. a concurrent flush picked it
-                // up). The steer is on the wire; if it succeeds the
-                // agent gets it via the native path AND normal
-                // dispatch — duplicate delivery is benign (agent gets
-                // the same message twice). Log so this is visible if it
-                // ever happens in production.
-                tracing::warn!(
-                    channel = %channel_id,
-                    event_id = %event_id_hex,
-                    "native steer accepted by read loop but event was not in queue to withhold \
-                     — possible duplicate delivery if steer succeeds"
-                );
-            }
             let ack_tx_clone = steer_ack_tx.clone();
             let event_id_for_watcher = event_id_hex.clone();
             tokio::spawn(async move {
@@ -3745,10 +3725,11 @@ fn try_native_steer(
             true
         }
         Err(e) => {
+            queue.release_native_steer(channel_id, &event_id_hex);
             tracing::info!(
                 channel = %channel_id,
                 error = ?e,
-                "non-cancelling steer not accepted — falling back to cancel+merge"
+                "non-cancelling steer not accepted — leaving event in ordered queue (no cancel)"
             );
             false
         }
@@ -3787,6 +3768,10 @@ fn dispatch_pending(
                 break;
             }
         };
+        // Freeze the only steering capability signal for this dispatched
+        // session. A later run-id/session-update notification cannot upgrade
+        // an agent that did not advertise support at initialize time.
+        queue.mark_running(channel_id, agent.acp.steering_supported());
         tracing::debug!(agent = agent.index, channel = %channel_id, affinity_hit, "agent_claimed");
 
         let recoverable_batch = match ctx.dedup_mode {
@@ -3805,8 +3790,9 @@ fn dispatch_pending(
         // it via the matching sender stored in `TaskMeta.steer_tx`.
         // Installed for every prompt task: the read loop picks the steer
         // transport at write time from `active_run_id` and the agent's
-        // advertised `_session/steering` capability, and acks
-        // `ExpectedRunIdMissing` (→ cancel+merge) when it has neither.
+        // advertised `_meta.steering.supported` capability. A missing
+        // capability means this receiver is never used; the event stays in
+        // the ordered queue without cancellation.
         let (tx, rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
         agent.acp.install_steer_rx(rx);
         let steer_tx = Some(tx);
@@ -3921,6 +3907,14 @@ fn handle_prompt_result(
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    // A completed turn for a channel is now being processed/acknowledged:
+    // the per-session turn state machine enters `Publishing` so a second
+    // event arriving during this window waits in the ordered queue rather
+    // than steering a settled turn. `queue.mark_complete` (below) settles
+    // the state back to `Queued`.
+    if let PromptSource::Channel(channel_id) = &result.source {
+        queue.on_publishing(*channel_id);
+    }
     let successful_steer_deliveries = pool
         .task_map()
         .values()
@@ -4217,8 +4211,8 @@ fn handle_prompt_result(
                 }
             }
         }
-        // Cancel-drain expiry: a control-signal cancel (steer fallback,
-        // interrupt, or explicit stop) did not drain within its bounded
+        // Cancel-drain expiry: an explicit interrupt/stop (or retained legacy
+        // internal Steer control) did not drain within its bounded
         // grace window. The process is poisoned/uncertain like a hard
         // timeout — respawn it — but this is NOT the configured max-turn
         // cap, so the message must name the actual grace, not
@@ -8459,10 +8453,9 @@ mod error_outcome_emission_tests {
     /// hard-cap. The agent itself is NOT returned to the idle pool: it is
     /// handed to `spawn_respawn_task` instead, mirroring a fatal `Timeout`.
     ///
-    /// This reproduces the full steer-fallback incident, not just the
-    /// original batch in isolation: the steer ack handler already released
-    /// the new triggering event back to `queue` (`lib.rs`'s
-    /// `ExpectedRunIdMissing` path) before the cancel-drain expiry fires. The
+    /// This reproduces the explicit interrupt path, not an ordinary steering
+    /// fallback: the new triggering event is already in `queue` before the
+    /// cancel-drain expiry fires. The
     /// next `flush_next()` must merge the surviving original event (via
     /// `cancelled_events`) with that already-queued new event (via `events`)
     /// exactly once each — proving no loss and no duplication.
@@ -8507,10 +8500,9 @@ mod error_outcome_emission_tests {
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        // The steer ack handler releases the new event to the queue BEFORE
-        // signaling the fallback ControlSignal::Steer that ultimately times
-        // out on drain — so it is already queued by the time
-        // handle_prompt_result runs.
+        // The new event was already queued (the ordered-queue fallback leaves
+        // a second eligible event in place when steering is unavailable), so
+        // it is picked up by `flush_next` when the cancelled batch is merged.
         queue.push(QueuedEvent {
             channel_id,
             event: new_event.clone(),
