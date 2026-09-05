@@ -55,6 +55,7 @@ import { mergeMentionProfileLookups } from "./mentionProfileLookup";
 import {
   appendUniqueName,
   buildTeamMentionCandidates,
+  channelMemberMentionCandidates,
   formatSearchUserDisplayName,
   formatSearchUserSecondaryLabel,
   formatTeamMention,
@@ -408,7 +409,11 @@ export function useMentions(
       .filter((candidate) => candidate.displayName.trim().length > 0);
     return coalesceAgentAutocompleteCandidates(
       coalesceAutocompleteCandidatesByKey(
-        [...candidatesByPubkey.values(), ...personaCandidates],
+        channelMemberMentionCandidates(
+          [...candidatesByPubkey.values(), ...personaCandidates],
+          mentionChannelId,
+          memberPubkeys,
+        ),
         globalSearchIdentityKey,
       ),
       {
@@ -431,6 +436,7 @@ export function useMentions(
     managedAgentsQuery.data,
     memberPubkeys,
     members,
+    mentionChannelId,
     mentionableAgentPubkeys,
     mentionProfiles,
     personaNameByPubkey,
@@ -443,15 +449,26 @@ export function useMentions(
     [mentionCandidates],
   );
   const mentionCandidatesWithTeams = React.useMemo(
-    () => [
-      ...mentionCandidates,
-      ...buildTeamMentionCandidates(
-        teamsQuery.data ?? [],
-        personasQuery.data ?? [],
-        mentionCandidates,
+    () =>
+      channelMemberMentionCandidates(
+        [
+          ...mentionCandidates,
+          ...buildTeamMentionCandidates(
+            teamsQuery.data ?? [],
+            personasQuery.data ?? [],
+            mentionCandidates,
+          ),
+        ],
+        mentionChannelId,
+        memberPubkeys,
       ),
+    [
+      mentionCandidates,
+      mentionChannelId,
+      memberPubkeys,
+      personasQuery.data,
+      teamsQuery.data,
     ],
-    [mentionCandidates, personasQuery.data, teamsQuery.data],
   );
   const ownerPubkeys = React.useMemo(
     () => [
@@ -563,12 +580,15 @@ export function useMentions(
       return filterCachedAgentSuggestions(
         previousSuggestionsRef.current,
         mentionCandidatesWithTeams,
+        mentionChannelId ? memberPubkeys : undefined,
       );
     }
     return [];
   }, [
     matchingSuggestions,
+    memberPubkeys,
     mentionCandidatesWithTeams,
+    mentionChannelId,
     mentionQuery,
     userSearchQuery.isFetching,
   ]);

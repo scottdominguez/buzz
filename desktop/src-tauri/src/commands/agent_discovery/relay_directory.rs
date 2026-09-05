@@ -135,8 +135,9 @@ async fn list_relay_agents_for_selection(
         .ok_or_else(|| "relay agent membership authority is unavailable".to_string())?;
 
     // Membership is the authoritative and bounded candidate source. Only
-    // channels visible to this identity are read, and only bot-role p-tags can
-    // drive the downstream managed-policy and owner-profile lookups.
+    // channels visible to this identity are read. Every membership role can
+    // identify an agent; signed directory/profile records determine identity
+    // type, rather than conflating the channel role with agent discovery.
     let mut membership_filter = serde_json::json!({
         "kinds": [39002],
         "authors": [&relay_pubkey],

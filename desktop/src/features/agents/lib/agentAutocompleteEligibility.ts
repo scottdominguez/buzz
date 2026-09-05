@@ -242,10 +242,14 @@ export function filterCachedAgentSuggestions<
   T extends {
     isAgent?: boolean;
     pubkey?: string;
+    personaId?: string;
+    teamId?: string;
+    teamMembers?: readonly { pubkey?: string; personaId?: string }[];
   },
 >(
   suggestions: readonly T[],
   currentCandidates: readonly AgentAutocompleteCandidate[],
+  channelMemberPubkeys?: ReadonlySet<string>,
 ) {
   const admittedAgentPubkeys = new Set(
     currentCandidates.flatMap((candidate) =>
@@ -254,12 +258,29 @@ export function filterCachedAgentSuggestions<
         : [],
     ),
   );
-  return suggestions.filter(
-    (suggestion) =>
+  return suggestions.filter((suggestion) => {
+    if (channelMemberPubkeys) {
+      // Cached results must obey the NEW roster, including every team target.
+      const targets = suggestion.teamId
+        ? (suggestion.teamMembers ?? [])
+        : [suggestion];
+      if (
+        !targets.length ||
+        !targets.every((target) => {
+          const pubkey = target.pubkey ?? target.personaId;
+          return Boolean(
+            pubkey && channelMemberPubkeys.has(normalizePubkey(pubkey)),
+          );
+        })
+      )
+        return false;
+    }
+    return (
       !suggestion.isAgent ||
       !suggestion.pubkey ||
-      admittedAgentPubkeys.has(normalizePubkey(suggestion.pubkey)),
-  );
+      admittedAgentPubkeys.has(normalizePubkey(suggestion.pubkey))
+    );
+  });
 }
 
 type AgentAutocompleteCandidate = {

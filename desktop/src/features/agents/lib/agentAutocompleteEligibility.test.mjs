@@ -1,6 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+test("cached channel suggestions cannot restore removed humans or team targets during search", () => {
+  const human = { pubkey: "aa", isAgent: false };
+  const team = {
+    teamId: "team",
+    teamMembers: [{ pubkey: "aa" }, { pubkey: "bb" }],
+  };
+  const template = { personaId: "template", isAgent: true };
+  assert.deepEqual(
+    filterCachedAgentSuggestions([human, team, template], [], new Set()),
+    [],
+  );
+  assert.deepEqual(
+    filterCachedAgentSuggestions([human, team], [], new Set(["aa"])),
+    [human],
+  );
+  assert.deepEqual(
+    filterCachedAgentSuggestions([team], [], new Set(["aa", "bb"])),
+    [team],
+  );
+  assert.deepEqual(filterCachedAgentSuggestions([human, team, template], []), [
+    human,
+    team,
+    template,
+  ]);
+});
+
 import {
   coalesceAgentAutocompleteCandidates,
   filterAdmittedMentionPubkeys,
