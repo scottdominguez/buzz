@@ -569,12 +569,15 @@ export function useMentions(
       return filterCachedAgentSuggestions(
         previousSuggestionsRef.current,
         mentionCandidatesWithTeams,
+        mentionChannelId ? memberPubkeys : undefined,
       );
     }
     return [];
   }, [
     matchingSuggestions,
+    memberPubkeys,
     mentionCandidatesWithTeams,
+    mentionChannelId,
     mentionQuery,
     userSearchQuery.isFetching,
   ]);
