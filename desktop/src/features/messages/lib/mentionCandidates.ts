@@ -50,6 +50,19 @@ export type MentionCandidate = {
   isGlobalSearchResult?: boolean;
 };
 
+/** In a channel, mention identities must come from its current member roster. */
+export function channelMemberMentionCandidates(
+  candidates: MentionCandidate[],
+  channelId: string | null,
+  memberPubkeys: ReadonlySet<string>,
+): MentionCandidate[] {
+  if (!channelId) return candidates;
+  return candidates.filter((candidate) => {
+    const pubkey = candidate.pubkey ?? candidate.personaId;
+    return Boolean(pubkey && memberPubkeys.has(pubkey.toLowerCase()));
+  });
+}
+
 export function mentionCandidateLabel(candidate: MentionCandidate) {
   return (
     candidate.displayName ??

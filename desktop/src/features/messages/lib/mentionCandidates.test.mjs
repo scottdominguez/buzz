@@ -3,8 +3,32 @@ import test from "node:test";
 
 import {
   buildTeamMentionCandidates,
+  channelMemberMentionCandidates,
   formatTeamMention,
 } from "./mentionCandidates.ts";
+
+test("channel picker excludes nonmembers even if locally managed or globally found", () => {
+  const rows = [
+    { kind: "identity", pubkey: "aa", isMember: true },
+    { kind: "identity", pubkey: "bb", isManagedAgent: true, isMember: false },
+    {
+      kind: "identity",
+      pubkey: "cc",
+      isGlobalSearchResult: true,
+      isMember: false,
+    },
+    { kind: "persona", personaId: "template", isMember: false },
+  ];
+  assert.deepEqual(
+    channelMemberMentionCandidates(rows, "channel", new Set(["aa"])),
+    [rows[0]],
+  );
+  assert.deepEqual(
+    channelMemberMentionCandidates(rows, "channel", new Set()),
+    [],
+  );
+  assert.equal(channelMemberMentionCandidates(rows, null, new Set()), rows);
+});
 
 function persona(id, displayName, isActive = true) {
   return {

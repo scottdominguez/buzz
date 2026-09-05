@@ -55,6 +55,7 @@ import { mergeMentionProfileLookups } from "./mentionProfileLookup";
 import {
   appendUniqueName,
   buildTeamMentionCandidates,
+  channelMemberMentionCandidates,
   formatSearchUserDisplayName,
   formatSearchUserSecondaryLabel,
   formatTeamMention,
@@ -408,7 +409,11 @@ export function useMentions(
       .filter((candidate) => candidate.displayName.trim().length > 0);
     return coalesceAgentAutocompleteCandidates(
       coalesceAutocompleteCandidatesByKey(
-        [...candidatesByPubkey.values(), ...personaCandidates],
+        channelMemberMentionCandidates(
+          [...candidatesByPubkey.values(), ...personaCandidates],
+          mentionChannelId,
+          memberPubkeys,
+        ),
         globalSearchIdentityKey,
       ),
       {
@@ -431,6 +436,7 @@ export function useMentions(
     managedAgentsQuery.data,
     memberPubkeys,
     members,
+    mentionChannelId,
     mentionableAgentPubkeys,
     mentionProfiles,
     personaNameByPubkey,
