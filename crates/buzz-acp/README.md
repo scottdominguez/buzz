@@ -252,6 +252,63 @@ no-capability agent falls back to the ordered queue with zero `session/cancel`.
 in-flight turn is cancelled and re-prompted with the new request framed as a
 replacement. `queue` delivers after the current turn, always.
 
+### Mention-Loop Guards
+
+In multi-agent channels, an agent-to-agent mention cascade can spin a prompt
+loop: A replies to B, B replies to A, A replies again … until the owner steps
+in. Three guards (all ON by default, env-tunable) protect against this while
+leaving **human-authored triggers completely unchanged** — a turn triggered by
+the human owner is never limited by these guards.
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--max-agent-chain` | `BUZZ_ACP_MAX_AGENT_CHAIN` | `3` | Maximum agent-to-agent chain depth per thread. When a turn is triggered by an event authored by **another agent** (a NIP-OA-verified same-owner sibling, not the human owner), the thread's chain counter is incremented; beyond this depth the harness refuses to auto-respond and stays silent. A human message resets the chain. `0` disables the guard. |
+| `--pingpong-limit` | `BUZZ_ACP_PINGPONG_LIMIT` | `2` | Ping-pong detection. When the same two pubkeys alternate mentions in one thread for more than this many consecutive rounds, the thread enters a cooldown and the harness logs loudly instead of responding. `0` disables the guard. |
+| `--pingpong-cooldown-secs` | `BUZZ_ACP_PINGPONG_COOLDOWN_SECS` | `60` | Per-thread cooldown after a ping-pong is detected. |
+| `--agent-reply-rate` | `BUZZ_ACP_AGENT_REPLY_RATE` | `6` | Max agent-triggered auto-replies per channel per minute (sliding window). Over the limit, agent-triggered events are **queued with a channel cooldown** — they are never dropped, and human-triggered turns are never affected. `0` disables the guard. |
+| `--agent-reply-cooldown-secs` | `BUZZ_ACP_AGENT_REPLY_COOLDOWN_SECS` | `30` | Per-channel cooldown after the agent auto-reply rate is exceeded. |
+
+An author counts as **another agent** when its kind:0 profile carries a NIP-OA
+`auth` tag proving the same owner as this harness (a "sibling" bot). The owner
+itself is a human. With no owner resolved, no author is classified as an agent
+and the guards never limit.
+
+**Behavior per guard:**
+
+1. **Agent chain depth** — each agent-authored trigger increments a counter
+   inherited from its thread (rooted at the NIP-10 thread root, or the event
+   itself for top-level messages). Past `--max-agent-chain` consecutive
+   agent-triggered turns, the harness logs a warning and stays silent until a
+   human posts in the thread.
+2. **Ping-pong detection** — two agents alternating mentions in one thread more
+   than `--pingpong-limit` consecutive rounds puts that thread into a
+   `--pingpong-cooldown-secs` cooldown. During the cooldown every agent trigger
+   in the thread is refused with a loud log; other threads are unaffected.
+3. **Agent auto-reply rate** — at most `--agent-reply-rate` agent-triggered
+   auto-replies per channel per minute. Over the limit the channel enters a
+   `--agent-reply-cooldown-secs` cooldown during which agent-triggered events
+   stay queued (dispatch is deferred, never dropped). Human events are never
+   rate-limited and never count against the window.
+
+### Bounded Startup Backlog Ingestion
+
+When the harness points at a busy channel, the relay replays a large backlog
+(hundreds of messages) during startup. To keep startup bounded and avoid
+crashing on oversized backlog floods:
+
+- While a channel is still draining its **startup snapshot** (before its first
+  dispatch), at most `BUZZ_ACP_CONTEXT_MESSAGE_LIMIT` events are ingested per
+  channel (hard cap, clamped to a 500-event absolute ceiling even when context
+  is disabled). Events beyond the cap are **skipped with an INFO line, never
+  fatal**.
+- After the channel's first dispatch the cap is lifted and live events flow
+  unbounded.
+- Oversized events are tolerated: snapshot content is clamped to 64 KiB per
+  event with an elision marker, and malformed events are skipped without
+  panicking.
+- Any panic in channel snapshot/backlog ingestion is logged (to both tracing
+  and stderr) before the process exits — no silent deaths.
+
 ### Shared Identity
 
 All N agents authenticate as the **same Nostr bot identity** — users see one bot regardless of how many agents are running. The same channel is never processed by two agents simultaneously (the queue enforces this). Cross-channel message ordering is not guaranteed when N>1.
@@ -310,7 +367,12 @@ Forum event kinds:
 
 Each channel has at most one prompt in flight. Multiple channels can be processed concurrently when agents > 1.
 
-> **Note:** On startup, the harness replays all unprocessed @mentions since the last run. Expect a burst of activity if there are stale events in the channel.
+> **Note:** On startup, the harness replays unprocessed @mentions since the last
+> run, bounded per channel by `BUZZ_ACP_CONTEXT_MESSAGE_LIMIT` while the
+> channel's startup snapshot drains (see
+> [Bounded Startup Backlog Ingestion](#bounded-startup-backlog-ingestion)).
+> Beyond the cap, backlog events are skipped with an INFO line — expect a
+> bounded burst, not the full history.
 
 ## Bring Your Own Harness (BYOH)
 
