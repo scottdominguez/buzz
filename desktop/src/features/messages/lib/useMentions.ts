@@ -449,15 +449,26 @@ export function useMentions(
     [mentionCandidates],
   );
   const mentionCandidatesWithTeams = React.useMemo(
-    () => [
-      ...mentionCandidates,
-      ...buildTeamMentionCandidates(
-        teamsQuery.data ?? [],
-        personasQuery.data ?? [],
-        mentionCandidates,
+    () =>
+      channelMemberMentionCandidates(
+        [
+          ...mentionCandidates,
+          ...buildTeamMentionCandidates(
+            teamsQuery.data ?? [],
+            personasQuery.data ?? [],
+            mentionCandidates,
+          ),
+        ],
+        mentionChannelId,
+        memberPubkeys,
       ),
+    [
+      mentionCandidates,
+      mentionChannelId,
+      memberPubkeys,
+      personasQuery.data,
+      teamsQuery.data,
     ],
-    [mentionCandidates, personasQuery.data, teamsQuery.data],
   );
   const ownerPubkeys = React.useMemo(
     () => [

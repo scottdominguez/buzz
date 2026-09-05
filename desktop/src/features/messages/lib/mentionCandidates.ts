@@ -58,8 +58,15 @@ export function channelMemberMentionCandidates(
 ): MentionCandidate[] {
   if (!channelId) return candidates;
   return candidates.filter((candidate) => {
-    const pubkey = candidate.pubkey ?? candidate.personaId;
-    return Boolean(pubkey && memberPubkeys.has(pubkey.toLowerCase()));
+    const targets =
+      candidate.kind === "team" ? (candidate.teamMembers ?? []) : [candidate];
+    return (
+      targets.length > 0 &&
+      targets.every((target) => {
+        const pubkey = target.pubkey ?? target.personaId;
+        return Boolean(pubkey && memberPubkeys.has(pubkey.toLowerCase()));
+      })
+    );
   });
 }
 

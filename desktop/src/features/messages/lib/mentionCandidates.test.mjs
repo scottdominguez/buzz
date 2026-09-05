@@ -30,6 +30,30 @@ test("channel picker excludes nonmembers even if locally managed or globally fou
   assert.equal(channelMemberMentionCandidates(rows, null, new Set()), rows);
 });
 
+test("fresh channel teams require every resolved target to remain a channel member", () => {
+  const team = {
+    kind: "team",
+    teamId: "t",
+    teamMembers: [{ pubkey: "aa" }, { personaId: "bb" }],
+  };
+  assert.deepEqual(
+    channelMemberMentionCandidates([team], "c", new Set(["aa"])),
+    [],
+  );
+  assert.deepEqual(
+    channelMemberMentionCandidates([team], "c", new Set(["aa", "bb"])),
+    [team],
+  );
+  assert.deepEqual(
+    channelMemberMentionCandidates(
+      [{ ...team, teamMembers: [] }],
+      "c",
+      new Set(),
+    ),
+    [],
+  );
+});
+
 function persona(id, displayName, isActive = true) {
   return {
     id,
