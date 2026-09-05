@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod classify;
 mod config;
 mod engram_fetch;
 mod filter;
@@ -26,6 +27,9 @@ pub use usage::TurnUsage;
 #[doc(hidden)]
 pub mod test_api {
     pub use crate::acp::AcpClient;
+    pub use crate::classify::{
+        Admission, AuthorClass, Classification, InboundClass, InboundClassifier, RecipientEvidence,
+    };
     pub use crate::config::{DedupMode, PermissionMode};
     pub use crate::ingest::{
         effective_cap, ingest_snapshot, BacklogLimiter, IngestReport, INGEST_ABSOLUTE_CAP,
@@ -37,7 +41,10 @@ pub mod test_api {
         PromptContext, PromptOutcome, PromptResult, SessionState, SteerAck, SteerError,
         SteerRequest, TaskMeta,
     };
-    pub use crate::queue::{BatchEvent, EventQueue, FlushBatch, QueuedEvent};
+    pub use crate::queue::{
+        format_prompt, BatchEvent, CancelReason, EventQueue, FlushBatch, FormatPromptArgs,
+        QueuedEvent,
+    };
     pub use crate::relay::{ChannelInfo, RestClient};
     pub use crate::turn_state::{EventDisposition, EventIntent, TurnState, TurnStateMachine};
 }
@@ -57,6 +64,7 @@ use buzz_core::observer::{
     OBSERVER_MAX_PLAINTEXT_LEN,
 };
 use clap::Parser;
+use classify::{Admission, AuthorClass, InboundClass, InboundClassifier};
 use config::{
     AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
     MultipleEventHandling, RespondTo, SubscribeMode,
@@ -2250,8 +2258,14 @@ async fn tokio_main() -> Result<()> {
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
     let dedup_mode = config.dedup_mode;
-    let mut queue =
-        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let mut queue = EventQueue::new(dedup_mode)
+        .with_in_flight_deadline(config.max_turn_duration_secs)
+        .with_coalescing_window(Duration::from_millis(config.coalesce_window_ms));
+    let classifier_names = std::env::var("BUZZ_ACP_DISPLAY_NAME")
+        .ok()
+        .into_iter()
+        .chain(config.session_title.clone());
+    let mut inbound_classifier = InboundClassifier::new(pubkey_hex.clone(), classifier_names);
 
     // Mention-loop guards (Phase 3): protect multi-agent channels from
     // agent-to-agent mention cascades. All three guards default ON and are
@@ -2641,6 +2655,11 @@ async fn tokio_main() -> Result<()> {
         }
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
+        let queue_flush_deadline = if queue.has_flushable_work() {
+            None
+        } else {
+            queue.next_flush_deadline()
+        };
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
@@ -2670,6 +2689,29 @@ async fn tokio_main() -> Result<()> {
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
+                }
+                _ = async {
+                    match queue_flush_deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep(deadline.saturating_duration_since(std::time::Instant::now())).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    if pool_ready {
+                        for (channel_id, thread_tags) in dispatch_pending(
+                            &mut pool,
+                            &mut queue,
+                            &ctx,
+                            &mut loop_guards,
+                            &mut backlog_limiter,
+                            &mut last_activity,
+                        ) {
+                            typing_channels.insert(channel_id, thread_tags);
+                        }
+                    }
+                    None
                 }
                 // Gated on pending work: with an empty queue there is nothing
                 // for the retry to dispatch, and a past `retry_at` would
@@ -2860,8 +2902,52 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
-                            if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
-                                tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
+                            let author_hex = buzz_event.event.pubkey.to_hex();
+                            let author_class = if author_hex == pubkey_hex {
+                                AuthorClass::SelfAuthored
+                            } else if owner_cache.get().is_some_and(|owner| author_hex == owner) {
+                                AuthorClass::Owner
+                            } else if is_owner_or_sibling(
+                                &author_hex,
+                                &owner_cache,
+                                &ctx.rest_client,
+                            )
+                            .await
+                            {
+                                AuthorClass::AgentPeer
+                            } else {
+                                AuthorClass::Other
+                            };
+                            let classification =
+                                inbound_classifier.classify(&buzz_event.event, author_class);
+                            tracing::debug!(
+                                channel_id = %buzz_event.channel_id,
+                                event_id = %buzz_event.event.id.to_hex(),
+                                author_class = ?author_class,
+                                class = %classification.class,
+                                admission = ?classification.admission,
+                                recipient = ?classification.recipient,
+                                "classified inbound event"
+                            );
+                            if classification.class == InboundClass::LegacyFallback {
+                                tracing::warn!(
+                                    channel_id = %buzz_event.channel_id,
+                                    event_id = %buzz_event.event.id.to_hex(),
+                                    "inbound classification uncertain — preserving pre-lane admission"
+                                );
+                            }
+                            let classification_admission =
+                                if author_class == AuthorClass::SelfAuthored
+                                    && !config.ignore_self
+                                    && !classification.duplicate
+                                {
+                                    Admission::Admit
+                                } else {
+                                    classification.admission
+                                };
+                            if classification.class == InboundClass::SelfAuthoredOrDuplicate
+                                && classification_admission != Admission::Admit
+                            {
                                 continue;
                             }
 
@@ -3020,9 +3106,26 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                             };
+                            match classification_admission {
+                                Admission::Admit => {}
+                                Admission::AttachContext => {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %buzz_event.event.id.to_hex(),
+                                        "attaching passive context/FYI without creating work"
+                                    );
+                                    queue.attach_context(QueuedEvent {
+                                        channel_id: buzz_event.channel_id,
+                                        event: buzz_event.event,
+                                        received_at: std::time::Instant::now(),
+                                        prompt_tag,
+                                    });
+                                    continue;
+                                }
+                                Admission::Ignore => continue,
+                            }
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
-                            let author_hex = buzz_event.event.pubkey.to_hex();
                             let event_id_hex = buzz_event.event.id.to_hex();
 
                             // ── Phase 3: bounded ingest + mention-loop guards ──
@@ -3047,19 +3150,8 @@ async fn tokio_main() -> Result<()> {
                             // (NIP-OA-verified same-owner siblings, excluding
                             // the human owner) are limited; human-authored
                             // triggers are completely unchanged.
-                            let owner_hex = owner_cache.get().map(str::to_owned);
                             let thread_key = guard_thread_key(&buzz_event.event);
-                            let author_is_agent = match owner_hex.as_deref() {
-                                Some(owner) if author_hex != *owner => {
-                                    is_owner_or_sibling(
-                                        &author_hex,
-                                        &owner_cache,
-                                        &ctx.rest_client,
-                                    )
-                                    .await
-                                }
-                                _ => false,
-                            };
+                            let author_is_agent = author_class == AuthorClass::AgentPeer;
                             let mut guard_rate_limited = false;
                             if author_is_agent {
                                 match loop_guards.evaluate_agent_trigger(
@@ -3317,7 +3409,7 @@ async fn tokio_main() -> Result<()> {
                     let _ = result_rx;
                     if !pool_ready {
                         tracing::debug!("heartbeat_skipped_pool_not_ready");
-                    } else if queue.has_flushable_work() {
+                    } else if queue.has_undispatched_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
                             dispatch_pending(
@@ -7361,6 +7453,7 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             multiple_event_handling: config::MultipleEventHandling::Queue,
+            coalesce_window_ms: config::DEFAULT_COALESCE_WINDOW_MS,
             ignore_self: true,
             kinds_override: None,
             channels_override: None,
@@ -7587,6 +7680,7 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             multiple_event_handling: config::MultipleEventHandling::Queue,
+            coalesce_window_ms: config::DEFAULT_COALESCE_WINDOW_MS,
             ignore_self: true,
             kinds_override: None,
             channels_override: None,
