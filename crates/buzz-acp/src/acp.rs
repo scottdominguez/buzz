@@ -1086,6 +1086,19 @@ impl AcpClient {
     async fn write_ndjson(&mut self, value: &serde_json::Value) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
+        // Bounded writes (the lorelei companion): a serialized frame larger
+        // than the read-side line cap can never be delivered by the agent's
+        // own LinesCodec, and writing it would stream an unbounded blob into
+        // the pipe. Refuse loudly instead — the concrete byte count and error
+        // are logged before the turn fails, never a silent death.
+        if line.len() > MAX_LINE_SIZE {
+            let message = format!(
+                "refusing to write oversized ACP frame: {} bytes exceeds the {MAX_LINE_SIZE}-byte line cap",
+                line.len()
+            );
+            tracing::error!(target: "acp::wire", "{}", message);
+            return Err(AcpError::Protocol(message));
+        }
         tokio::time::timeout(WRITE_TIMEOUT, async {
             self.stdin.write_all(line.as_bytes()).await?;
             self.stdin.write_all(b"\n").await?;

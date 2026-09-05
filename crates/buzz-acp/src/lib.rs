@@ -4,6 +4,8 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod ingest;
+mod loop_guard;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -25,6 +27,11 @@ pub use usage::TurnUsage;
 pub mod test_api {
     pub use crate::acp::AcpClient;
     pub use crate::config::{DedupMode, PermissionMode};
+    pub use crate::ingest::{
+        effective_cap, ingest_snapshot, BacklogLimiter, IngestReport, INGEST_ABSOLUTE_CAP,
+        INGEST_MAX_EVENT_BYTES,
+    };
+    pub use crate::loop_guard::{GuardDecision, LoopGuard, LoopGuardConfig};
     pub use crate::pool::{
         run_prompt_task, AgentPool, ChannelInfoResolver, ControlSignal, MemberResolver, OwnedAgent,
         PromptContext, PromptOutcome, PromptResult, SessionState, SteerAck, SteerError,
@@ -56,6 +63,8 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
+use ingest::BacklogLimiter;
+use loop_guard::{GuardDecision, LoopGuard};
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
@@ -1942,6 +1951,29 @@ mod idle_pool_sleep_tests {
     }
 }
 
+/// Thread key used by the mention-loop guards: the NIP-10 root event id when
+/// the event is a thread reply, otherwise the event's own id (a top-level
+/// message is its own thread).
+fn guard_thread_key(event: &nostr::Event) -> String {
+    queue::parse_thread_tags(event)
+        .root_event_id
+        .unwrap_or_else(|| event.id.to_hex())
+}
+
+/// Route panics through tracing **and** stderr so a fatal error in any
+/// processing path — channel snapshot/backlog ingestion included — is logged
+/// before the process exits. No silent deaths.
+///
+/// The default panic hook is replaced, so this hook reproduces the stderr
+/// print itself (tracing may be routed to a file or filtered below `error`).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = format!("buzz-acp: fatal panic: {info}");
+        tracing::error!(target: "buzz_acp::panic", "{message}");
+        eprintln!("{message}");
+    }));
+}
+
 pub fn run() -> Result<()> {
     config::propagate_legacy_env_vars();
     tokio_main()
@@ -1991,6 +2023,10 @@ async fn tokio_main() -> Result<()> {
         )
         .compact()
         .init();
+
+    // Any panic from here on (channel snapshot/backlog ingestion included) is
+    // logged before the process exits — no silent deaths.
+    install_panic_hook();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
 
@@ -2216,6 +2252,17 @@ async fn tokio_main() -> Result<()> {
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+
+    // Mention-loop guards (Phase 3): protect multi-agent channels from
+    // agent-to-agent mention cascades. All three guards default ON and are
+    // env-tunable; human-triggered turns are never limited.
+    let mut loop_guards = LoopGuard::new(config.loop_guard);
+    // Bounded channel snapshot/backlog ingestion (lorelei): while a channel
+    // is draining its startup backlog, at most `context_message_limit` events
+    // are ingested (hard cap); beyond the cap events are skipped with an INFO
+    // line so startup stays bounded. Released after the channel's first
+    // dispatch so live events flow unbounded.
+    let mut backlog_limiter = BacklogLimiter::new(config.context_message_limit);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -2524,9 +2571,14 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut loop_guards,
+                    &mut backlog_limiter,
+                    &mut last_activity,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2576,9 +2628,14 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in
-                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-            {
+            for (channel_id, thread_tags) in dispatch_pending(
+                &mut pool,
+                &mut queue,
+                &ctx,
+                &mut loop_guards,
+                &mut backlog_limiter,
+                &mut last_activity,
+            ) {
                 typing_channels.insert(channel_id, thread_tags);
             }
         }
@@ -2967,6 +3024,92 @@ async fn tokio_main() -> Result<()> {
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
                             let event_id_hex = buzz_event.event.id.to_hex();
+
+                            // ── Phase 3: bounded ingest + mention-loop guards ──
+                            //
+                            // Bounded channel snapshot/backlog ingestion
+                            // (lorelei): while a channel is still draining its
+                            // startup backlog (before its first dispatch), at
+                            // most `context_message_limit` events are ingested
+                            // per channel; beyond the cap they are skipped with
+                            // an INFO line so startup stays bounded. Live events
+                            // after the first dispatch are never capped.
+                            if !backlog_limiter.should_ingest(buzz_event.channel_id) {
+                                tracing::info!(
+                                    channel_id = %buzz_event.channel_id,
+                                    cap = config.context_message_limit,
+                                    "startup backlog beyond snapshot cap — skipping event (not fatal)"
+                                );
+                                continue;
+                            }
+
+                            // Mention-loop guards. Only agent-authored triggers
+                            // (NIP-OA-verified same-owner siblings, excluding
+                            // the human owner) are limited; human-authored
+                            // triggers are completely unchanged.
+                            let owner_hex = owner_cache.get().map(str::to_owned);
+                            let thread_key = guard_thread_key(&buzz_event.event);
+                            let author_is_agent = match owner_hex.as_deref() {
+                                Some(owner) if author_hex != *owner => {
+                                    is_owner_or_sibling(
+                                        &author_hex,
+                                        &owner_cache,
+                                        &ctx.rest_client,
+                                    )
+                                    .await
+                                }
+                                _ => false,
+                            };
+                            let mut guard_rate_limited = false;
+                            if author_is_agent {
+                                match loop_guards.evaluate_agent_trigger(
+                                    buzz_event.channel_id,
+                                    &thread_key,
+                                    &author_hex,
+                                    std::time::Instant::now(),
+                                ) {
+                                    GuardDecision::Respond => {}
+                                    GuardDecision::ChainRefused => {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            thread = %thread_key,
+                                            author = %author_hex,
+                                            max_agent_chain =
+                                                config.loop_guard.max_agent_chain,
+                                            "mention-loop guard: agent chain depth exceeded — staying silent"
+                                        );
+                                        continue;
+                                    }
+                                    GuardDecision::PingPongCooldown => {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            thread = %thread_key,
+                                            author = %author_hex,
+                                            cooldown_secs = config
+                                                .loop_guard
+                                                .pingpong_cooldown
+                                                .as_secs(),
+                                            "mention-loop guard: agent ping-pong in thread — staying silent"
+                                        );
+                                        continue;
+                                    }
+                                    GuardDecision::RateLimited => {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            thread = %thread_key,
+                                            author = %author_hex,
+                                            cooldown_secs = config
+                                                .loop_guard
+                                                .agent_reply_cooldown
+                                                .as_secs(),
+                                            "mention-loop guard: agent auto-reply rate exceeded — queueing with cooldown"
+                                        );
+                                        guard_rate_limited = true;
+                                    }
+                                }
+                            } else {
+                                loop_guards.on_human_trigger(&thread_key);
+                            }
                             // Clone for the non-cancelling steer fork, which
                             // needs the event to render the steer body. The
                             // clone is unconditional because we don't know
@@ -3000,7 +3143,13 @@ async fn tokio_main() -> Result<()> {
                             // Event is already queued. For an in-flight channel,
                             // let the per-session state machine choose true
                             // steering, explicit interruption, or FIFO waiting.
-                            if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
+                            // A rate-limited agent trigger is held in the ordered
+                            // queue (its dispatch is deferred by the channel
+                            // cooldown) and is never steered into a live turn.
+                            if accepted
+                                && queue.is_channel_in_flight(buzz_event.channel_id)
+                                && !guard_rate_limited
+                            {
                                 // Author eligibility (owner ∪ allowlist ∪
                                 // siblings, or channel members under
                                 // respond_to=members) is already enforced by
@@ -3064,7 +3213,14 @@ async fn tokio_main() -> Result<()> {
                             }
                             if pool_ready {
                                 for (channel_id, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                    dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut loop_guards,
+                    &mut backlog_limiter,
+                    &mut last_activity,
+                )
                                 {
                                     typing_channels.insert(channel_id, thread_tags);
                                 }
@@ -3164,7 +3320,14 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                            dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut loop_guards,
+                    &mut backlog_limiter,
+                    &mut last_activity,
+                )
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -3262,9 +3425,14 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut loop_guards,
+                    &mut backlog_limiter,
+                    &mut last_activity,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3287,9 +3455,14 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut loop_guards,
+                    &mut backlog_limiter,
+                    &mut last_activity,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3385,9 +3558,14 @@ async fn tokio_main() -> Result<()> {
                 // event waits in the ordered queue until the turn completes.
                 // If the in-flight task has already returned, the released
                 // event is dispatched here.
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut loop_guards,
+                    &mut backlog_limiter,
+                    &mut last_activity,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3413,9 +3591,14 @@ async fn tokio_main() -> Result<()> {
                             "ready",
                             None,
                         );
-                        for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                        {
+                        for (channel_id, thread_tags) in dispatch_pending(
+                            &mut pool,
+                            &mut queue,
+                            &ctx,
+                            &mut loop_guards,
+                            &mut backlog_limiter,
+                            &mut last_activity,
+                        ) {
                             typing_channels.insert(channel_id, thread_tags);
                         }
                     }
@@ -3743,6 +3926,8 @@ fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
+    guards: &mut LoopGuard,
+    backlog_limiter: &mut BacklogLimiter,
     last_activity: &mut tokio::time::Instant,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
@@ -3752,6 +3937,19 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        // Mention-loop guard: while a channel's agent auto-reply cooldown is
+        // active, dispatch is deferred (the batch is restored FIFO and
+        // re-flushed once the cooldown expires). Nothing is dropped, and
+        // human-triggered turns never reach this path.
+        if guards.is_rate_cooldown(channel_id, std::time::Instant::now()) {
+            tracing::info!(
+                channel = %channel_id,
+                "mention-loop guard: agent auto-reply cooldown active — deferring dispatch"
+            );
+            queue.requeue_preserve_timestamps(batch);
+            queue.mark_complete(channel_id);
+            break;
+        }
         let typing_scope = batch
             .events
             .last()
@@ -3829,6 +4027,9 @@ fn dispatch_pending(
             },
         );
         dispatched_channels.push((channel_id, typing_scope));
+        // The channel's startup snapshot has been consumed by its first
+        // dispatch: lift the bounded-ingest cap so live events flow unbounded.
+        backlog_limiter.release(channel_id);
         *last_activity = tokio::time::Instant::now();
     }
     tracing::debug!(
@@ -7187,6 +7388,7 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            loop_guard: loop_guard::LoopGuardConfig::default(),
         }
     }
 
@@ -7412,6 +7614,7 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            loop_guard: loop_guard::LoopGuardConfig::default(),
         }
     }
 

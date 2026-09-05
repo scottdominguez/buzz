@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use clap::ValueEnum;
@@ -14,6 +15,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::filter::SubscriptionRule;
+use crate::loop_guard::{
+    LoopGuardConfig, DEFAULT_AGENT_REPLY_COOLDOWN_SECS, DEFAULT_AGENT_REPLY_RATE,
+    DEFAULT_MAX_AGENT_CHAIN, DEFAULT_PINGPONG_COOLDOWN_SECS, DEFAULT_PINGPONG_LIMIT,
+};
 
 /// Default idle timeout (seconds) when neither `--idle-timeout` nor the
 /// deprecated `--turn-timeout` is set.
@@ -522,6 +527,38 @@ pub struct CliArgs {
     /// Requires `--lazy-pool`; ignored otherwise. 0 disables idle re-sleep.
     #[arg(long, env = "BUZZ_ACP_IDLE_POOL_SLEEP", default_value_t = 0)]
     pub idle_pool_sleep: u64,
+
+    /// Mention-loop guard: maximum agent-to-agent chain depth per thread.
+    /// When a turn is triggered by an event authored by another agent (a
+    /// same-owner sibling, not the human owner), the thread's chain counter is
+    /// incremented; beyond this depth the harness refuses to auto-respond and
+    /// stays silent. A human message resets the chain. 0 disables the guard.
+    #[arg(long, env = "BUZZ_ACP_MAX_AGENT_CHAIN", default_value_t = DEFAULT_MAX_AGENT_CHAIN)]
+    pub max_agent_chain: u32,
+
+    /// Mention-loop guard: ping-pong detection limit. When the same two
+    /// pubkeys alternate mentions in one thread for more than this many
+    /// consecutive rounds, the thread enters a cooldown and the harness logs
+    /// loudly instead of responding. 0 disables the guard.
+    #[arg(long, env = "BUZZ_ACP_PINGPONG_LIMIT", default_value_t = DEFAULT_PINGPONG_LIMIT)]
+    pub pingpong_limit: u32,
+
+    /// Mention-loop guard: per-thread cooldown (seconds) after a ping-pong is
+    /// detected.
+    #[arg(long, env = "BUZZ_ACP_PINGPONG_COOLDOWN_SECS", default_value_t = DEFAULT_PINGPONG_COOLDOWN_SECS)]
+    pub pingpong_cooldown_secs: u64,
+
+    /// Mention-loop guard: maximum agent-triggered auto-replies per channel
+    /// per minute. Over the limit, agent-triggered events are queued with a
+    /// channel cooldown instead of being dispatched. Human-triggered turns are
+    /// NEVER limited. 0 disables the guard.
+    #[arg(long, env = "BUZZ_ACP_AGENT_REPLY_RATE", default_value_t = DEFAULT_AGENT_REPLY_RATE)]
+    pub agent_reply_rate: u32,
+
+    /// Mention-loop guard: per-channel cooldown (seconds) after the agent
+    /// auto-reply rate is exceeded.
+    #[arg(long, env = "BUZZ_ACP_AGENT_REPLY_COOLDOWN_SECS", default_value_t = DEFAULT_AGENT_REPLY_COOLDOWN_SECS)]
+    pub agent_reply_cooldown_secs: u64,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -620,6 +657,9 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Mention-loop guard limits for multi-agent channels. All three guards
+    /// default ON; a per-guard value of 0 disables that guard.
+    pub loop_guard: LoopGuardConfig,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1172,6 +1212,13 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            loop_guard: LoopGuardConfig {
+                max_agent_chain: args.max_agent_chain,
+                pingpong_limit: args.pingpong_limit,
+                pingpong_cooldown: Duration::from_secs(args.pingpong_cooldown_secs),
+                agent_reply_rate: args.agent_reply_rate,
+                agent_reply_cooldown: Duration::from_secs(args.agent_reply_cooldown_secs),
+            },
         };
 
         Ok(config)
@@ -1193,7 +1240,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} multiple_event_handling={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} multiple_event_handling={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} require_reply={} memory={} model={} permission_mode={} {} {} loop_guards=(max_agent_chain={}, pingpong_limit={}, pingpong_cooldown={}s, agent_reply_rate={}/min, agent_reply_cooldown={}s)",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1217,6 +1264,11 @@ impl Config {
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
+            self.loop_guard.max_agent_chain,
+            self.loop_guard.pingpong_limit,
+            self.loop_guard.pingpong_cooldown.as_secs(),
+            self.loop_guard.agent_reply_rate,
+            self.loop_guard.agent_reply_cooldown.as_secs(),
         )
     }
 }
@@ -1547,6 +1599,7 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            loop_guard: LoopGuardConfig::default(),
         }
     }
 
@@ -3139,5 +3192,91 @@ channels = "ALL"
             "Found secret-bearing env args without hide_env_values=true. \
              Add `hide_env_values = true` to each: {violations:?}"
         );
+    }
+
+    // ── Mention-loop guard configuration (Phase 3) ─────────────────────────────
+
+    #[test]
+    fn loop_guard_defaults_are_all_on() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        let config = Config::from_args(args).expect("default config parses");
+
+        assert_eq!(config.loop_guard.max_agent_chain, DEFAULT_MAX_AGENT_CHAIN);
+        assert_eq!(config.loop_guard.pingpong_limit, DEFAULT_PINGPONG_LIMIT);
+        assert_eq!(
+            config.loop_guard.pingpong_cooldown,
+            Duration::from_secs(DEFAULT_PINGPONG_COOLDOWN_SECS)
+        );
+        assert_eq!(config.loop_guard.agent_reply_rate, DEFAULT_AGENT_REPLY_RATE);
+        assert_eq!(
+            config.loop_guard.agent_reply_cooldown,
+            Duration::from_secs(DEFAULT_AGENT_REPLY_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
+    fn loop_guard_flags_are_tunable() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--max-agent-chain",
+            "5",
+            "--pingpong-limit",
+            "4",
+            "--pingpong-cooldown-secs",
+            "120",
+            "--agent-reply-rate",
+            "9",
+            "--agent-reply-cooldown-secs",
+            "45",
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("config parses");
+
+        assert_eq!(config.loop_guard.max_agent_chain, 5);
+        assert_eq!(config.loop_guard.pingpong_limit, 4);
+        assert_eq!(
+            config.loop_guard.pingpong_cooldown,
+            Duration::from_secs(120)
+        );
+        assert_eq!(config.loop_guard.agent_reply_rate, 9);
+        assert_eq!(
+            config.loop_guard.agent_reply_cooldown,
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn loop_guard_zero_disables_a_guard() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--max-agent-chain",
+            "0",
+            "--pingpong-limit",
+            "0",
+            "--agent-reply-rate",
+            "0",
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("config parses");
+
+        assert_eq!(config.loop_guard.max_agent_chain, 0);
+        assert_eq!(config.loop_guard.pingpong_limit, 0);
+        assert_eq!(config.loop_guard.agent_reply_rate, 0);
+    }
+
+    #[test]
+    fn loop_guard_summary_reports_the_active_limits() {
+        let config = test_config(SubscribeMode::All);
+        let summary = config.summary();
+        assert!(
+            summary.contains("loop_guards=(max_agent_chain="),
+            "summary must report guard limits: {summary}"
+        );
+        assert!(summary.contains("agent_reply_rate=6/min"));
     }
 }
