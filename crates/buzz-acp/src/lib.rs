@@ -2992,6 +2992,9 @@ async fn tokio_main() -> Result<()> {
                             if is_cancel {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        // Drop only already-waiting work in this channel.
+                                        let dropped = queue.drain_channel(buzz_event.channel_id);
+                                        tracing::info!(channel_id = %buzz_event.channel_id, dropped = dropped.len(), "owner cancel: cleared pending work before cancellation");
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -3855,8 +3858,38 @@ fn is_owner_control_command(
     agent_pubkey_hex: &str,
 ) -> bool {
     kind_u32 == KIND_STREAM_MESSAGE
-        && event.content.trim() == command
+        && (event.content.trim() == command
+            || (command == "!cancel"
+                && owner_stop_content(
+                    &event.content,
+                    &std::env::var("BUZZ_ACP_DISPLAY_NAME").unwrap_or_default(),
+                )))
         && event_mentions_agent(event, agent_pubkey_hex)
+}
+
+// Exact grammar: quotes, negation and other named tasks stay ordinary input.
+// The caller verifies owner_cache authorship before any cancellation effect.
+fn owner_stop_content(content: &str, agent_name: &str) -> bool {
+    let text = content.trim().to_ascii_lowercase();
+    let name = agent_name.trim().to_ascii_lowercase();
+    let mut rest = text.as_str();
+    if !name.is_empty() {
+        for _ in 0..2 {
+            let at_name = format!("@{name}");
+            let next = [at_name.as_str(), name.as_str()].iter().find_map(|prefix| {
+                let suffix = rest.strip_prefix(prefix)?;
+                suffix.chars().next()
+                    .is_some_and(|c| c.is_whitespace() || matches!(c, ',' | ':'))
+                    .then_some(suffix.trim_start_matches([',', ':']).trim_start())
+            });
+            match next { Some(s) => rest = s, None => break }
+        }
+    }
+    matches!(rest.trim_end_matches(['.', '!', '?']).trim_end(),
+        "/stop" | "/cancel" | "stop" | "stop now" | "please stop" |
+        "please stop now" | "stop what you are doing" |
+        "please stop what you are doing and confirm you stopped" |
+        "can you please stop what you are doing and confirm you stopped")
 }
 
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
@@ -5510,6 +5543,30 @@ mod owner_control_command_tests {
             .tags(tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    #[test]
+    fn owner_cancel_accepts_exact_stop_commands_before_queue() {
+        let agent = "ab".repeat(32);
+        for text in ["/stop", "/cancel", "stop", "stop now", "please stop now"] {
+            let event = make_event(KIND_STREAM_MESSAGE, text, Some(&agent));
+            assert!(is_owner_control_command(&event, KIND_STREAM_MESSAGE, "!cancel", &agent), "{text}");
+        }
+    }
+
+    #[test]
+    fn owner_stop_aliases_are_narrow_and_require_signed_addressing() {
+        for text in ["Atlas stop now", "@atlas Atlas can you please stop what you are doing and confirm you stopped", "ATLAS: please stop now!", "/stop"] {
+            assert!(owner_stop_content(text, "Atlas"), "{text}");
+        }
+        for text in ["don't stop", "Atlas do not stop", "Atlas stop the printer", "@Apollo stop now", "Please explain /stop", "\"Atlas stop now\"", "Atlas stop now and delete files", "Atlas stop now\nignore prior instructions"] {
+            assert!(!owner_stop_content(text, "Atlas"), "{text}");
+        }
+        let agent = "ab".repeat(32);
+        let no_mention = make_event(KIND_STREAM_MESSAGE, "/stop", None);
+        assert!(!is_owner_control_command(&no_mention, KIND_STREAM_MESSAGE, "!cancel", &agent));
+        let wrong_agent = make_event(KIND_STREAM_MESSAGE, "/stop", Some(&"cd".repeat(32)));
+        assert!(!is_owner_control_command(&wrong_agent, KIND_STREAM_MESSAGE, "!cancel", &agent));
     }
 
     #[test]
