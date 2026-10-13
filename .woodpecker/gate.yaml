@@ -1,0 +1,36 @@
+when:
+  - event: [push, pull_request]
+    branch: [main, 'lane/**']
+
+clone:
+  - name: git
+    image: woodpeckerci/plugin-git
+    settings:
+      partial: false
+      depth: 0
+
+steps:
+  - name: desktop
+    image: node:24.14.1-bookworm
+    commands:
+      - npm install --global pnpm@11.4.0
+      - pnpm install --frozen-lockfile
+      - cd desktop
+      - node --import ./test-loader.mjs --experimental-strip-types --test src/features/messages/ui/conversationVirtualization.test.mjs src/features/messages/lib/mentionProfileLookup.test.mjs
+      - pnpm test
+      - pnpm typecheck
+      - pnpm exec biome check src/features/home/ui/InboxDetailPane.tsx src/features/messages/ui/MessageThreadPanel.tsx src/features/messages/useThreadReplies.ts src/features/messages/ui/conversationVirtualization.ts src/features/messages/ui/conversationVirtualization.test.mjs src/features/messages/lib/useMentions.ts src/features/messages/lib/mentionProfileLookup.ts src/features/messages/lib/mentionProfileLookup.test.mjs
+      - pnpm build
+
+  # Preserve the Windows MSVC target check on the Linux Woodpecker runner.
+  # cargo-xwin supplies clang-cl, the Windows SDK and the CRT for that target.
+  - name: windows-rust
+    image: messense/cargo-xwin:0.23.0
+    environment:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      CARGO_BUILD_JOBS: '4'
+    commands:
+      - rustup target add x86_64-pc-windows-msvc
+      - mkdir -p desktop/src-tauri/binaries
+      - 'for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do touch "desktop/src-tauri/binaries/$$bin-x86_64-pc-windows-msvc.exe"; done'
+      - cargo xwin check --locked --manifest-path desktop/src-tauri/Cargo.toml --workspace --all-targets --target x86_64-pc-windows-msvc
