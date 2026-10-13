@@ -12,6 +12,7 @@ clone:
 steps:
   - name: desktop
     image: node:24.14.1-bookworm
+    depends_on: []
     commands:
       - npm install --global pnpm@11.4.0
       - pnpm install --frozen-lockfile
@@ -26,9 +27,13 @@ steps:
   # cargo-xwin supplies clang-cl, the Windows SDK and the CRT for that target.
   - name: windows-rust
     image: messense/cargo-xwin:0.23.0
+    depends_on: []
     environment:
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
       CARGO_BUILD_JOBS: '4'
+      # Opus's MSVC CMake logic assumes these intrinsic flags; clang-cl
+      # needs them explicitly while checking the Windows target.
+      CL_FLAGS: '/clang:-msse4.1 /clang:-mssse3'
     commands:
       - rustup target add x86_64-pc-windows-msvc
       - mkdir -p desktop/src-tauri/binaries
